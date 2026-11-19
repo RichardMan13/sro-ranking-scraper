@@ -1,8 +1,9 @@
 # SRO Ranking Scraper Pipeline (v1.0)
 
 *   **Author:** richardman13
-*   **Status:** Ready for Commit
+*   **Status:** Approved
 *   **Date:** 2026-11-18
+*   **Approved Date:** 2026-11-19
 
 --------------------------------------------------------------------------------
 
@@ -694,6 +695,19 @@ Nesta seção são documentadas as abordagens arquiteturais e tecnológicas aval
 *   **Cons**:
     *   Distorção matemática nas séries temporais: o disparo extraordinário pós-Fortress War cria um intervalo de apenas 3 a 4 horas em relação ao snapshot anterior, fazendo com que deltas brutos pareçam quedas de atividade quando comparados com intervalos normais de 12 horas.
 *   **Reason for Rejection**: `Rejected by author: Indução de viés analítico severo na medição de velocidade de progressão e retenção. Adotou-se o cálculo normalizado de taxa horária contínua (rate_per_hour = delta / hours_since_last_snapshot).`
+
+--------------------------------------------------------------------------------
+
+## Decision Log
+
+| ID | Date | Decision | Status | Rationale |
+| :--- | :--- | :--- | :--- | :--- |
+| ADR-001 | 2026-11-19 | Extração HTTP-first via `httpx` (HTTP/2) + `lxml`/`orjson`, proibindo browsers headless (Playwright/Selenium). | Approved | Mantém o worker abaixo de 512MB de RAM e reduz detecção anti-bot e latência de rede. |
+| ADR-002 | 2026-11-19 | Orquestração via Prefect 3 self-hosted com deployments independentes (12h + pós-FW por servidor). | Approved | Isolamento de falhas por alvo e retries nativos com baixo consumo de memória (<150MB) vs Airflow/Spark. |
+| ADR-003 | 2026-11-19 | Persistência estritamente append-only no PostgreSQL 16 com particionamento mensal `RANGE (created_at)` e `PRIMARY KEY (id, created_at)`. | Approved | Garante auditoria temporal imutável, evita table bloat e simplifica expurgo/arquivamento futuro. |
+| ADR-004 | 2026-11-19 | Quarentena dead-letter em disco (`./quarantine/{server_id}/{run_id}.html.gz`) com retenção de 30 dias e referência via SHA-256 em `scrape_runs`. | Approved | Evita armazenamento de HTML bruto em TOAST/BYTEA no PostgreSQL preservando performance analítica. |
+| ADR-005 | 2026-11-19 | Circuit Breaker persistido na tabela `servers` (`circuit_breaker_until`, cooldown padrão de 6h) com Top-Rank Integrity Guard (posições 1–3). | Approved | Protege o IP do host contra bloqueios Cloudflare/Turnstile e impede contaminação por schema drift silencioso. |
+| ADR-006 | 2026-11-19 | Normalização temporal nas views SQL (`rate_per_hour = delta / hours_since_last_snapshot`). | Approved | Elimina distorção estatística causada por intervalos irregulares entre coletas de 12h e disparos pós-Fortress War. |
 
 --------------------------------------------------------------------------------
 

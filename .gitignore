@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Quarantine payloads (keep directory tracked)
+quarantine/*
+!quarantine/.gitkeep
+
