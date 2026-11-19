@@ -17,7 +17,7 @@ Pipeline de extração e persistência histórica de rankings de jogadores e gui
   - **Status:** Em fase de mapeamento e análise de estrutura
 
 - **Electus Online**:
-  - **URL / Referência:** [https://electus.online/en/character/BaRToL](https://electus.online/en/character/BaRToL) (Exemplo de perfil/personagem e ranking)
+  - **URL / Referência:** [https://electus.online/en/ranking](https://electus.online/en/ranking)
   - **Status:** Em fase de mapeamento e análise de estrutura
 
 - **Play Golden (Golden Online)**:
