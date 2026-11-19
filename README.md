@@ -1,6 +1,6 @@
 # SRO Ranking Scraper
 
-A minimal pipeline that extracts public player and guild rankings from private Silkroad Online servers, stores them as temporal snapshots in PostgreSQL, and exposes analytical SQL views for BI tools (Power BI, Streamlit, etc.).
+A minimal pipeline that extracts public player and guild rankings from private Silkroad Online servers, stores them as temporal snapshots in PostgreSQL, and exposes analytical SQL views for Streamlit.
 
 ## Quick Overview
 ```
