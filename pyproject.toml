@@ -23,7 +23,7 @@ dependencies = [
     "structlog>=24.1.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "lxml-stubs>=0.5.1",
     "mypy>=1.10.0",
