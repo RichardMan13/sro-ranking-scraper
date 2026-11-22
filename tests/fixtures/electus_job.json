@@ -1,0 +1,86 @@
+{
+  "items": [
+    {
+      "rank": 1,
+      "charname": "Elec_Player_001",
+      "guild": "ElecEmpire",
+      "job_type": "TRADER",
+      "job_level": 120,
+      "job_exp": 9000000,
+      "job_points": 4200
+    },
+    {
+      "rank": 2,
+      "charname": "Elec_Player_002",
+      "guild": "Valkyries",
+      "job_type": "THIEF",
+      "job_level": 119,
+      "job_exp": 8500000,
+      "job_points": 3900
+    },
+    {
+      "rank": 3,
+      "charname": "Elec_Player_003",
+      "guild": "SroLegends",
+      "job_type": "HUNTER",
+      "job_level": 118,
+      "job_exp": 8000000
+    },
+    {
+      "rank": 4,
+      "charname": "Elec_Player_004",
+      "guild": "TitanUnion",
+      "job_type": "MERCADOR",
+      "job_level": 117,
+      "job_exp": 7500000
+    },
+    {
+      "rank": 5,
+      "charname": "Elec_Player_005",
+      "guild": "Pharaohs",
+      "job_type": "LADRÃO",
+      "job_level": 116,
+      "job_exp": 7000000
+    },
+    {
+      "rank": 6,
+      "charname": "Elec_Player_006",
+      "guild": "NightWatch",
+      "job_type": "CAÇADOR",
+      "job_level": 115,
+      "job_exp": 6500000
+    },
+    {
+      "rank": 7,
+      "charname": "Elec_Player_007",
+      "guild": "ElecEmpire",
+      "job_type": "TRADER",
+      "job_level": 114,
+      "job_exp": 6000000
+    },
+    {
+      "rank": 8,
+      "charname": "Elec_Player_008",
+      "guild": "Valkyries",
+      "job_type": "THIEF",
+      "job_level": 113,
+      "job_exp": 5500000
+    },
+    {
+      "rank": 9,
+      "charname": "Elec_Player_009",
+      "guild": "SroLegends",
+      "job_type": "HUNTER",
+      "job_level": 112,
+      "job_exp": 5000000
+    },
+    {
+      "rank": 10,
+      "charname": "Elec_Orphan_Job",
+      "guild": "OrphanClan",
+      "job_type": "THIEF",
+      "job_level": 111,
+      "job_exp": 4500000
+    }
+  ]
+}

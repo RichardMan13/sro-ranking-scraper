@@ -1,0 +1,35 @@
+## 001_sro_ranking_scraper_pipeline.md
+
+- **Packaging / Dev Dependencies (`pyproject.toml`):** The design (§ Detailed Implementation Plan #3) specifies dev dependencies under `[project.optional-dependencies].dev`, whereas `pyproject.toml` defines them under PEP 735 `[dependency-groups] dev`.
+- **Docker Compose Worker Command, Healthcheck & Fallback Password (`docker-compose.yml`):**
+  - The design (§ Detailed Implementation Plan #1) specifies `scraper-worker` running `python -m src.flows.orchestrator --mode serve`; `docker-compose.yml` overrides `command` to `sh -c "alembic upgrade head && exec python -m src.flows.orchestrator --mode serve"` and adds an undocumented container `healthcheck` (`test -w /app/quarantine && kill -0 1`).
+  - The design (§ NFR 2) prohibits hardcoded credentials, but `docker-compose.yml` provides a hardcoded fallback password (`${POSTGRES_PASSWORD:-sro_dev_password}`) for `postgres` and `scraper-worker`.
+- **Configuration Defaults & SQLite Support (`src/core/config.py`, `src/core/database.py`):**
+  - The design (§ Detailed Implementation Plan #7) specifies default `PREFECT_API_URL` as `http://prefect-server:4200/api`, whereas `Settings.prefect_api_url` defaults to `"http://localhost:4200/api"` (overridden only in `docker-compose.yml`).
+  - The design specifies PostgreSQL 16 (`postgresql+asyncpg://`) exclusively, whereas `Settings.validate_non_empty_database_url` (`_ALLOWED_DB_SCHEME_RE`) and `create_engine_from_url` add undocumented `sqlite` URL scheme support.
+- **Sequential Page & Category Fetching (`src/scrapers/base.py`, `src/scrapers/chronicle.py`, `src/scrapers/electus.py`, `src/scrapers/golden.py`):**
+  - The design (§ 3, § NFR 1) specifies asynchronous concurrent paginated HTTP requests bounded by `asyncio.Semaphore(3)`. Although `BaseRankingScraper` wraps `client.get` with `asyncio.Semaphore(3)`, categories (`player`, `job`, `guild`) and pages within each category are awaited sequentially in `for` loops, capping effective concurrency at 1.
+- **Pydantic Schema Validator Divergences (`src/models/pydantic_schemas.py`):**
+  - `RawPlayerRankingItem` applies `normalize_empty_strings` to `char_name` (design applies it only to `guild_name` and `title`) and adds an undocumented `clean_required_int` validator on `rank` and `level`.
+  - `RawJobRankingItem` adds undocumented `normalize_empty_strings` on `char_name` and `guild_name`, plus `clean_required_int` on `rank` and `job_level`.
+  - `RawGuildRankingItem` adds an undocumented `clean_required_int` validator on `rank`.
+  - `_clean_int_numbers` diverges from the design's digit-stripping logic (`"".join(filter(str.isdigit, str(v)))`): it strictly rejects non-integer floats and malformed strings with `ValueError`, splits `"/"` ratios, and strips trailing unit suffixes.
+  - `_normalize_race` uses word-token matching for `"CH"` / `"EU"` and returns `None` when both match, diverging from the design's substring matching.
+  - `_clean_float_numbers` adds undocumented `bool`/`NaN`/`Inf` rejection and multi-dot thousand-separator stripping.
+- **Scraper Engine Behavior & Undocumented Logic (`src/scrapers/base.py`):**
+  - When `servers.circuit_breaker_until` is active, `BaseRankingScraper.run()` returns an undocumented in-memory status `"SKIPPED_CIRCUIT_BREAKER"` (`ScrapeRunSummary(skipped=True)`) without inserting a `scrape_runs` row (in tension with Goal G2's "100% das execuções na tabela `scrape_runs`", though consistent with § 3's immediate abort with structured log).
+  - `CHALLENGE_HTML_MARKERS` includes an undocumented `"cf-turnstile"` signature in addition to the 4 markers specified in § 3.
+  - `_reconcile_jobs_into_players` adds undocumented fallback enrichment of `player.guild_name` from `job.guild_name` when `player.guild_name is None`, and preserves `player.job_exp` when `job.job_exp is None` instead of overwriting it.
+  - Adds undocumented in-memory deduplication (`_deduplicate_players`, `_deduplicate_jobs`, `_deduplicate_guilds`) and silent string truncation (`master_name[:64]`, `guild_name[:64]`, `title[:64]`, `fortress_held[:32]`) before database persistence.
+  - Quarantine `.html.gz` files concatenate multi-page payloads with undocumented HTML comment banners (`<!-- === QUARANTINE PAGE: ... === -->`) and compute `quarantine_sha256` on the gzip-compressed bytes.
+- **Electus HTML Fallback Column Range (`src/scrapers/electus.py`):**
+  - The design (§ 3) specifies HTML fallback column positions `[0..5]`, whereas `ElectusScraper._map_player_html` also extracts column `[6]` (`title`).
+- **Undocumented Orchestration & Registry Logic (`src/flows/orchestrator.py`, `src/flows/tasks.py`, `src/scrapers/__init__.py`):**
+  - `src/flows/orchestrator.py` defines an undocumented Prefect `@flow` named `manual_scrape_flow` (`manual-scrape-flow`) for `--mode manual`.
+  - `src/flows/tasks.py` and `src/flows/orchestrator.py` both run an undocumented import-time `_ensure_accessible_prefect_home()` fallback for `PREFECT_HOME`.
+  - `src/scrapers/__init__.py` introduces an undocumented `get_scraper()` factory and `_SCRAPER_REGISTRY`.
+- **Undocumented Repository Files & Test Suites:**
+  - `.env.example` is present in the repository but omitted from `## Detailed Implementation Plan`.
+  - `tests/test_flows.py`, `tests/test_models_db.py`, and the entire `tests/e2e/` suite (`_contracts.py`, `_loader.py`, `conftest.py`, `helpers/*`, `test_tier1_features.py`–`test_tier4_scenarios.py`) are not referenced in the design doc.
+- **Document Status Drift (`docs/designs/001_sro_ranking_scraper_pipeline.md`, `docs/designs/SITEMAP.md`):**
+  - Both documents still list Status as `Approved` rather than `Implemented` despite the v1.0 implementation existing in the workspace.

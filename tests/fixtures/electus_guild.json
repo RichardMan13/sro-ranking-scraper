@@ -1,0 +1,52 @@
+{
+  "data": [
+    {
+      "rank": 1,
+      "guild": "ElecEmpire",
+      "master": "Elec_Player_001",
+      "members": 50,
+      "itempoints": 210000.5,
+      "fortress": "Hotan"
+    },
+    {
+      "rank": 2,
+      "guild": "Valkyries",
+      "master": "Elec_Player_002",
+      "members": 48,
+      "itempoints": 198000.0,
+      "fortress": "Jangan"
+    },
+    {
+      "rank": 3,
+      "guild": "SroLegends",
+      "master": "Elec_Player_003",
+      "members": 44,
+      "itempoints": 175000.25,
+      "fortress": "Bandit"
+    },
+    {
+      "rank": 4,
+      "guild": "TitanUnion",
+      "master": "Elec_Player_004",
+      "members": 40,
+      "itempoints": 152000.0,
+      "fortress": "-"
+    },
+    {
+      "rank": 5,
+      "guild": "Pharaohs",
+      "master": "Elec_Player_005",
+      "members": 37,
+      "itempoints": 134000.0,
+      "fortress": "N/A"
+    },
+    {
+      "rank": 6,
+      "guild": "NightWatch",
+      "master": "Elec_Player_006",
+      "members": 33,
+      "itempoints": 121000.0,
+      "fortress": ""
+    }
+  ]
+}

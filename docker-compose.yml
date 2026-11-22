@@ -1,0 +1,98 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    mem_limit: 1g
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - work_mem=64MB
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sro_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-sro_rankings}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - sro_network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-sro_user} -d ${POSTGRES_DB:-sro_rankings}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  prefect-server:
+    image: prefecthq/prefect:3-python3.11
+    restart: unless-stopped
+    command: prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_HOME: /root/.prefect
+      PREFECT_SERVER_API_HOST: "0.0.0.0"
+      PREFECT_API_DATABASE_CONNECTION_URL: sqlite+aiosqlite:////root/.prefect/prefect.db
+    volumes:
+      - prefect_data:/root/.prefect
+    networks:
+      - sro_network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4200/api/health', timeout=5)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  scraper-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    mem_limit: 512m
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && exec python -m src.flows.orchestrator --mode serve
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-sro_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-sro_rankings}}
+      PREFECT_API_URL: http://prefect-server:4200/api
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      QUARANTINE_DIR: /app/quarantine
+      QUARANTINE_RETENTION_DAYS: ${QUARANTINE_RETENTION_DAYS:-30}
+      CIRCUIT_BREAKER_COOLDOWN_HOURS: ${CIRCUIT_BREAKER_COOLDOWN_HOURS:-6}
+      ELECTUS_CF_CLEARANCE: ${ELECTUS_CF_CLEARANCE:-}
+    volumes:
+      - ./quarantine:/app/quarantine
+    networks:
+      - sro_network
+    healthcheck:
+      test: ["CMD-SHELL", "test -w /app/quarantine && kill -0 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  sro_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  prefect_data:

@@ -1,7 +1,7 @@
 # SRO Ranking Scraper Pipeline (v1.0)
 
 *   **Author:** richardman13
-*   **Status:** Approved
+*   **Status:** Implemented
 *   **Date:** 2026-11-18
 *   **Approved Date:** 2026-11-19
 
@@ -39,8 +39,8 @@ A solução consiste em desacoplar a ingestão da análise, extraindo dados tabu
 
 ## Open Questions
 
-*   **Q1:** A rota de ranking do Electus Online permite consumo direto de endpoint JSON ou requer bypass de cabeçalhos/cookies específicos de sessão? *(Será investigado na fase de mapeamento técnico do scraper).*
-*   **Q2:** A Fortress War ocorre em horários e dias distintos entre os 3 servidores? *(Configurado dinamicamente por servidor na tabela `servers` através dos campos `fw_day_of_week` e `fw_end_time_utc`).*
+*   **Q1 (Resolvida):** *A rota de ranking do Electus Online permite consumo direto de endpoint JSON ou requer bypass de cabeçalhos/cookies específicos de sessão?* -> **Resolvido:** O `ElectusScraper` suporta tanto o endpoint JSON interno (`/api/ranking/{category}?page={n}`) quanto fallback tabular HTML (`/ranking/{category}?page={n}`), com injeção opcional de cookie `ELECTUS_CF_CLEARANCE` via `.env` e abertura imediata do Circuit Breaker (6h) caso receba HTTP 403/429 ou desafio Turnstile.
+*   **Q2 (Resolvida):** *A Fortress War ocorre em horários e dias distintos entre os 3 servidores?* -> **Resolvido:** Configurado dinamicamente por servidor na tabela `servers` através dos campos `fw_day_of_week` e `fw_end_time_utc`, com seed inicial padronizado na migração `001_initial_schema.py`.
 
 ## Critical User Journeys (CUJs)
 
@@ -115,25 +115,45 @@ O ambiente operacional é composto por 3 serviços orquestrados via `docker-comp
 
 ### 3. Motor de Extração HTTP-First & Circuit Breaker Persistente
 
-* **Sessão HTTPX Otimizada:** Cada execução utiliza cliente assíncrono `httpx.AsyncClient` com suporte a `http2=True`, limites estritos de conexões (`httpx.Limits(max_keepalive_connections=5, max_connections=10)`), timeouts específicos (Connect: 10s, Read: 30s) e rotação determinística de cabeçalhos legítimos (`User-Agent`, `Accept-Language`, `Sec-Ch-Ua`).
-* **Design Pattern Strategy por Alvo:**
-  * `BaseRankingScraper`: Classe base abstrata que encapsula retries exponenciais, medição de tempo, logging estruturado (`structlog`), persistência do circuit breaker e registro na tabela `scrape_runs`.
-  * `ChronicleScraper`: Implementa parsing tabular HTML via `lxml` com seletores CSS fixados em `table.ranking-table tbody tr`.
-  * `ElectusScraper`: Prioriza inspeção de endpoints JSON de paginação interna (`/api/ranking/...`). Emprega decodificação rápida via `orjson`.
-  * `PlayGoldenScraper`: Implementa parsing HTML padrão para templates clássicos de vSRO.
+* **Sessão HTTPX Otimizada:** Cada execução utiliza cliente assíncrono `httpx.AsyncClient` com suporte a `http2=True`, limites estritos de conexões (`httpx.Limits(max_keepalive_connections=5, max_connections=10)`), semáforo de concorrência (`asyncio.Semaphore(3)`), timeouts específicos (Connect: 10s, Read: 30s) e rotação determinística de cabeçalhos legítimos (`User-Agent`, `Accept-Language`, `Sec-Ch-Ua`). A categoria `player` executa primeiro como sonda de disponibilidade/anti-bot (abortando no primeiro request se houver bloqueio ou manutenção), seguida pela execução concorrente de `job` e `guild` via `asyncio.TaskGroup` sob o mesmo `asyncio.Semaphore(3)`, mantendo parada antecipada de paginação por categoria e cancelamento imediato da categoria irmã em caso de `BlockedChallengeError`, `TargetMaintenanceError` ou `TransportFetchError`.
+* **Política de Retries de Transporte vs. Circuit Breaker:**
+  * Retries de rede ocorrem **exclusivamente dentro do `BaseRankingScraper`** (máximo de 2 retentativas com backoff exponencial de 2s e 5s) e **apenas** para erros transitórios de transporte (`httpx.TransportError`, `httpx.TimeoutException`) ou HTTP `502`/`503`/`504`.
+  * Respostas HTTP `403`/`429` ou assinaturas de desafio anti-bot **nunca** sofrem retry: acionam imediatamente o Circuit Breaker (6h) e encerram a execução do alvo com status `BLOCKED_CHALLENGE`.
+  * As tasks do Prefect (`@task(retries=0)`) não reexecutam alvos bloqueados ou reprovados por validação, garantindo que cada execução gere exatamente **um** registro auditável em `scrape_runs` por alvo.
+* **Design Pattern Strategy & Contratos de Extração por Alvo:**
+  * `BaseRankingScraper`: Classe base abstrata que encapsula o ciclo completo de um alvo (`server_id`): verificação do circuit breaker, extração paginada concorrente de **Players**, **Jobs** e **Guilds**, deduplicação em memória (mantendo o menor `rank` por `char_name` / `guild_name`), reconciliação em memória (`Job` -> `Player`), validação Pydantic v2 com Top-Rank Integrity Guard, truncamento seguro de strings aos limites de coluna (`master_name[:64]`, `guild_name[:64]`, `title[:64]`, `fortress_held[:32]`), gravação de quarentena em disco e persistência transacional no PostgreSQL.
+  * **Estratégia de Reconciliação em Memória (`RawJobRankingItem` -> `RawPlayerRankingItem`):**
+    1. Em cada execução de um servidor (`ranking_category = 'all'`), o scraper coleta concorrentemente as páginas de **Player Ranking** (até Top 1.000), **Job Ranking** (até Top 500) e **Guild Ranking** (até Top 100).
+    2. Os itens validados e deduplicados de `RawJobRankingItem` são indexados em memória por `char_name` (case-sensitive por servidor) e mesclados (*left-join* em memória) nos registros de `RawPlayerRankingItem`: preenchem ou sobrescrevem `job_type` e `job_level`, atualizam `job_exp` somente quando `job_item.job_exp is not None` (preservando o valor existente do player caso contrário), preenchem `guild_name` como fallback quando `player.guild_name is None`, e adicionam `{"job_rank": job_item.rank, **job_item.extra_metrics}` ao dicionário `extra_metrics` do `RawPlayerRankingItem`.
+    3. Personagens presentes no Job Ranking que estejam fora do Top 1.000 do Player Ranking não geram linhas órfãs sem `level`/`rank_position` em `character_snapshots`, preservando a integridade das constraints `NOT NULL` e a consistência da window function de `v_character_activity_deltas`.
+  * **Especificação de Endpoints, Paginação e Seletores dos 3 Alvos:**
+
+| Alvo (`server_id`) | Base URL | Rotas & Paginação (Semáforo <= 3) | Seletores / Mapeamento de Campos |
+| :--- | :--- | :--- | :--- |
+| **`chronicle`** | `https://play-chronicle.com` | **Player:** `GET /ranking/player?page={1..10}` (100/pág, máx 1.000)<br>**Job:** `GET /ranking/job?page={1..5}` (100/pág, máx 500)<br>**Guild:** `GET /ranking/guild?page={1..2}` (50/pág, máx 100)<br>*(Para a paginação antecipadamente se `<tr>` retornar vazio)* | **Parser:** `lxml` (`table.ranking-table tbody tr`)<br>**Player `<td>`:** `[0]` rank, `[1]` char_name (`a.char-link` + `img[data-race]`/`alt` -> `race`), `[2]` guild_name, `[3]` level, `[4]` item_points, `[5]` honor_points, `[6]` title; extras (`pvp_kd`, `unique_points`) em `extra_metrics`.<br>**Job `<td>`:** `[0]` rank, `[1]` char_name, `[2]` guild_name, `[3]` job_type, `[4]` job_level, `[5]` job_exp.<br>**Guild `<td>`:** `[0]` rank, `[1]` guild_name, `[2]` master_name, `[3]` members_count (`"45/50"` -> `45`), `[4]` total_item_points, `[5]` fortress_held. |
+| **`electus`** | `https://electus.online` | **Player:** `GET /api/ranking/player?page={1..10}&limit=100` (fallback HTML `/ranking/player?page={1..10}`)<br>**Job:** `GET /api/ranking/job?page={1..5}&limit=100`<br>**Guild:** `GET /api/ranking/guild?page={1..2}&limit=50`<br>*(Suporta cookie opcional `cf_clearance` via `ELECTUS_CF_CLEARANCE`)* | **Parser Primário:** `orjson` (chave raiz `data` ou `items`).<br>**Chaves Player:** `rank`, `charname` -> `char_name`, `guild` -> `guild_name`, `race`/`race_id` (`1/"CH"`->`"CH"`, `2/"EU"`->`"EU"`), `level`, `itempoints` -> `item_points`, `job_type`, `job_level`, `job_points`, `honor` -> `honor_points`; chaves extras (`elo_points`, `sox_parts`, `hours_played`) em `extra_metrics`.<br>**Fallback HTML:** `table#ranking-table tbody tr` com posições colunares `[0..6]` (incluindo `[6]` `title` opcional no Player Ranking). |
+| **`play_golden`** | `https://play-golden.online` | **Player:** `GET /ranking/characters?page={1..10}` (100/pág, máx 1.000)<br>**Job:** `GET /ranking/jobs?page={1..5}` (100/pág, máx 500)<br>**Guild:** `GET /ranking/guilds?page={1..2}` (50/pág, máx 100) | **Parser:** `lxml` (`table.table-ranking tbody tr`)<br>**Player `<td>`:** `[0]` rank, `[1]` race (`img` src/alt `chinese`/`european`), `[2]` char_name, `[3]` guild_name, `[4]` level, `[5]` strength, `[6]` intellect, `[7]` item_points, `[8]` honor_points; extras (`gold`, `last_logout`) em `extra_metrics`.<br>**Job `<td>`:** `[0]` rank, `[1]` char_name, `[2]` job_type, `[3]` job_level, `[4]` job_exp, `[5]` guild_name.<br>**Guild `<td>`:** `[0]` rank, `[1]` guild_name, `[2]` master_name, `[3]` members_count, `[4]` total_item_points, `[5]` fortress_held. |
+
 * **Lógica do Circuit Breaker Persistente:**
-  * **Verificação Pré-Execução:** Antes de iniciar qualquer requisição, o worker consulta `servers.circuit_breaker_until`. Se `CURRENT_TIMESTAMP < circuit_breaker_until`, a execução para aquele alvo é abortada imediatamente sem envio de tráfego de rede, registrando log com o tempo restante de cooldown.
-  * **Detecção de Bloqueio:** O crawler inspeciona status HTTP (`403`, `429`) e assinaturas textuais no corpo/headers (ex: `<div id="turnstile-wrapper">`, tokens `cf-chl-bypass`, `cf-mitigated: challenge`).
-  * **Ativação:** Ao detectar desafio interativo Turnstile ou 403/429, o scraper executa:
+  * **Verificação Pré-Execução:** Antes de iniciar qualquer requisição, o worker consulta `servers.circuit_breaker_until`. Se `CURRENT_TIMESTAMP < circuit_breaker_until`, a execução para aquele alvo é abortada imediatamente sem envio de tráfego de rede e sem gravar nova linha em `scrape_runs` (evitando ruído no banco durante o cooldown), retornando em memória `ScrapeRunSummary(status="SKIPPED_CIRCUIT_BREAKER", skipped=True)` e registrando log estruturado com o tempo restante de cooldown.
+  * **Detecção de Bloqueio e Manutenção:**
+    * **Bloqueio Anti-Bot (`BLOCKED_CHALLENGE`):** Status HTTP `403` ou `429`, header `cf-mitigated: challenge`, ou assinaturas no HTML (`<div id="turnstile-wrapper">`, `cf-turnstile`, `cf-chl-bypass`, `Just a moment...`, `Attention Required! | Cloudflare`).
+    * **Manutenção do Servidor (`TARGET_MAINTENANCE`):** Status HTTP `503` com corpo indicando manutenção programada ou página HTML contendo banners explícitos (`Server under maintenance`, `Website under maintenance`), sem abertura do circuit breaker de 6h.
+    * **Erro de Transporte/HTTP (`HTTP_ERROR`):** Falha de conexão/timeout após as 2 retentativas de transporte ou status HTTP `500`/`502`/`504`.
+  * **Ativação do Cooldown:** Ao detectar `BLOCKED_CHALLENGE`, o scraper grava o payload em quarentena e executa:
     ```sql
-    UPDATE servers SET circuit_breaker_until = CURRENT_TIMESTAMP + INTERVAL '6 hours' WHERE id = :server_id;
+    UPDATE servers
+    SET circuit_breaker_until = CURRENT_TIMESTAMP + INTERVAL '6 hours',
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = :server_id;
     ```
-    Gravando status `BLOCKED_CHALLENGE` em `scrape_runs` e finalizando a task sem retentativas agressivas.
+    Gravando status `BLOCKED_CHALLENGE` em `scrape_runs` e finalizando a task sem retentativas adicionais.
 * **Orquestração de Disparos Extraordinários pós-Fortress War (FW):**
-  * Disparos pós-FW utilizam deployments independentes no Prefect 3 por servidor:
-    * `post_fw_flow.to_deployment(name="post-fw-chronicle", cron="30 22 * * 0")`
-    * `post_fw_flow.to_deployment(name="post-fw-electus", cron="...")`
-  * Os horários são parametrizados a partir das colunas `fw_day_of_week` e `fw_end_time_utc` da tabela `servers`, disparando 30 minutos após o término da fortaleza de cada servidor.
+  * Disparos pós-FW utilizam deployments independentes no Prefect 3 por servidor, servidos em conjunto com o flow de 12h no mesmo processo runner via `prefect.serve()`:
+    * `post_fw_flow.to_deployment(name="post-fw-chronicle", cron="30 22 * * 0", parameters={"server_id": "chronicle"})`
+    * `post_fw_flow.to_deployment(name="post-fw-electus", cron="30 21 * * 0", parameters={"server_id": "electus"})`
+    * `post_fw_flow.to_deployment(name="post-fw-play_golden", cron="30 20 * * 6", parameters={"server_id": "play_golden"})`
+  * Os expressões cron são geradas dinamicamente na inicialização do `orchestrator.py` somando 30 minutos a `fw_end_time_utc` no dia `fw_day_of_week` (0 = Domingo .. 6 = Sábado) lidos da tabela `servers`.
 
 ### 4. Validação de Contratos & Sistema de Quarentena
 
@@ -234,7 +254,20 @@ class RawPlayerRankingItem(BaseModel):
             return None
         if isinstance(v, (int, float)):
             return float(v)
-        cleaned = str(v).replace(",", ".").strip()
+        raw = str(v).strip()
+        if "," in raw and "." in raw:
+            if raw.rfind(",") < raw.rfind("."):
+                cleaned = raw.replace(",", "")
+            else:
+                cleaned = raw.replace(".", "").replace(",", ".")
+        elif "," in raw:
+            parts = raw.split(",")
+            if len(parts) == 2 and len(parts[1]) in (1, 2):
+                cleaned = raw.replace(",", ".")
+            else:
+                cleaned = raw.replace(",", "")
+        else:
+            cleaned = raw
         try:
             return float(cleaned)
         except ValueError:
@@ -317,21 +350,44 @@ class RawGuildRankingItem(BaseModel):
             return None
         if isinstance(v, (int, float)):
             return float(v)
-        cleaned = str(v).replace(",", ".").strip()
+        raw = str(v).strip()
+        if "," in raw and "." in raw:
+            if raw.rfind(",") < raw.rfind("."):
+                cleaned = raw.replace(",", "")
+            else:
+                cleaned = raw.replace(".", "").replace(",", ".")
+        elif "," in raw:
+            parts = raw.split(",")
+            if len(parts) == 2 and len(parts[1]) in (1, 2):
+                cleaned = raw.replace(",", ".")
+            else:
+                cleaned = raw.replace(",", "")
+        else:
+            cleaned = raw
         try:
             return float(cleaned)
         except ValueError:
             return None
 ```
 
-* **Critério de Detecção de Drift & Guard de Pódio:**
-  * **Top-Rank Integrity Guard:** Se os registros das posições 1, 2 ou 3 falharem na validação ou no parsing, o lote é rejeitado imediatamente, mesmo que a taxa global de erro esteja abaixo de 5%.
-  * **Taxa de Erro Global:** Rejeição do lote se `validation_errors / total_records > 0.05` ou se campos core (`rank`, `char_name`, `level`) forem corrompidos.
-  * **Contagem Mínima (`min_records_threshold`):** Chronicle (min 100), Electus (min 100), Play Golden (min 50).
-* **Mecanismo de Quarentena (Dead-Letter):**
-  * Payloads reprovados são compactados em gzip e gravados em `./quarantine/{server_id}/{run_id}.html.gz`.
-  * A tabela `scrape_runs` armazena apenas o hash `sha256`, tamanho em bytes e o caminho de referência.
-  * **Política de Retenção de Quarentena:** Arquivos em `./quarantine` com mais de 30 dias de criação são expurgados automaticamente por uma task de manutenção do Prefect para prevenir esgotamento de disco.
+* **Regras Defensivas de Validação (`src/models/pydantic_schemas.py`):**
+  * `clean_required_int` aplicado aos campos inteiros obrigatórios (`rank`, `level` em `RawPlayerRankingItem`; `rank`, `job_level` em `RawJobRankingItem`; `rank` em `RawGuildRankingItem`), rejeitando `bool`, strings vazias, floats não-inteiros e formatos malformados com `ValueError`.
+  * `normalize_empty_strings` aplicado também a `char_name` (em `RawPlayerRankingItem` e `RawJobRankingItem`) e `guild_name` (em `RawJobRankingItem`), impedindo que placeholders como `"-"`, `"None"`, `"No Name"`, `"XXXX"` ou `"N/A"` passem como nomes válidos.
+  * `_clean_int_numbers` rejeita `bool`, floats não-inteiros/não-finitos e strings ambíguas com `ValueError`, faz split de razões com `"/"` (ex.: `"45/50"` -> `45`) e remove sufixos de unidade após dígitos (ex.: `"120lv"` -> `120`).
+  * `_normalize_race` utiliza correspondência por tokens alfanuméricos (`re.findall(r"[A-Z0-9]+", ...)`) para `"CH"`/`"EU"` (além de `"CHINA"`/`"CHINESE"` e `"EUROPE"`/`"EUROPEAN"`), retornando `None` caso ambos os padrões coincidam simultaneamente.
+  * `_clean_float_numbers` rejeita `bool`, `NaN` e `Inf` (`math.isfinite`) e remove separadores de milhar com múltiplos pontos (ex.: `"1.234.567"` -> `1234567.0`).
+* **Critério de Detecção de Drift, Guard de Pódio e Regras de Status Canônico (`scrape_runs`):**
+  * **Granularidade da Execução (`ranking_category = 'all'`):** Cada disparo por servidor executa um único `scrape_run` atômico que consolida `character_snapshots` (com enriquecimento opcional de `Job Ranking`) e `guild_snapshots`.
+  * **Top-Rank Integrity Guard (Crítico):** Se os registros das posições 1, 2 ou 3 do **Player Ranking** (ou 1, 2 ou 3 do **Guild Ranking**, quando houver >= 3 guildas) falharem na validação ou estiverem ausentes, o lote inteiro é rejeitado imediatamente com status `SCHEMA_DRIFT`, independentemente da taxa global de erro.
+  * **Taxa de Erro Global & Status `PARTIAL_SUCCESS` vs `SCHEMA_DRIFT`:**
+    * Se `validation_errors == 0` e todas as regras de contagem mínima e pódio forem atendidas: os snapshots são persistidos e o status é `SUCCESS`.
+    * Se `0 < validation_errors / total_records <= 0.05` (com Top-Rank 1–3 íntegro e `valid_player_records >= servers.min_records_expected`): os registros válidos são persistidos normalmente, as linhas inválidas são registradas em `error_details`, e o status é `PARTIAL_SUCCESS` (considerado válido pelas views analíticas).
+    * Se `validation_errors / total_records > 0.05`: nenhum snapshot é persistido no banco, o payload bruto vai para quarentena e o status é `SCHEMA_DRIFT`.
+  * **Contagem Mínima (`min_records_expected`):** Aplicada sobre a contagem de registros válidos do **Player Ranking**: Chronicle (`min 100`), Electus (`min 100`), Play Golden (`min 50`). Para o **Guild Ranking**, exige-se um mínimo fixo de `5` guildas válidas (`MIN_GUILD_RECORDS = 5`). Caso a contagem válida fique abaixo desses limiares (sem erro de parsing estrutural), o lote é rejeitado e desviado para quarentena com status `LOW_COUNT_QUARANTINE`.
+* **Mecanismo de Quarentena (Dead-Letter) e Schema de `error_details`:**
+  * Payloads reprovados (`SCHEMA_DRIFT`, `LOW_COUNT_QUARANTINE`, `BLOCKED_CHALLENGE`) são concatenados com banners HTML delimitando categoria, URL e status (`<!-- === QUARANTINE PAGE: category=... url=... status=... === -->`), compactados em gzip e gravados em `./quarantine/{server_id}/{run_id}.html.gz`.
+  * A tabela `scrape_runs` armazena o caminho em `quarantine_file_path`, o hash SHA-256 calculado sobre os bytes gzip compactados em `quarantine_sha256` (`CHAR(64)`), o tamanho compactado em `quarantine_size_bytes` (`BIGINT`) e o diagnóstico estruturado em `error_details` (`JSONB` com o contrato `{"reason": str, "failed_category": str, "sample_errors": list[dict[str, Any]], "quarantine_sha256": Optional[str], "quarantine_size_bytes": Optional[int]}`).
+  * **Política de Retenção de Quarentena:** Arquivos em `./quarantine` com mais de 30 dias de modificação (`mtime`) são expurgados automaticamente pela task `purge_old_quarantine_task` ao final de cada `scheduled_12h_flow` para prevenir esgotamento de disco.
 
 ### 5. Modelagem de Dados Relacional & Temporal (PostgreSQL 16)
 
@@ -356,6 +412,16 @@ CREATE TABLE servers (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Seed Inicial Obrigatório dos 3 Servidores Alvo
+INSERT INTO servers (
+    id, display_name, base_url, current_season, is_active,
+    fw_day_of_week, fw_end_time_utc, min_records_expected
+) VALUES
+    ('chronicle', 'Chronicle SRO', 'https://play-chronicle.com', 'v1', TRUE, 0, '22:00:00', 100),
+    ('electus', 'Electus Online', 'https://electus.online', 'v1', TRUE, 0, '21:00:00', 100),
+    ('play_golden', 'Play Golden', 'https://play-golden.online', 'v1', TRUE, 6, '20:00:00', 50)
+ON CONFLICT (id) DO NOTHING;
+
 -- Tabela de Auditoria com Status Canônico
 CREATE TABLE scrape_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -373,6 +439,8 @@ CREATE TABLE scrape_runs (
     execution_time_ms INTEGER NOT NULL,
     http_status_code INTEGER,
     quarantine_file_path VARCHAR(255),
+    quarantine_sha256 CHAR(64),
+    quarantine_size_bytes BIGINT,
     error_details JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -383,7 +451,7 @@ CREATE TABLE characters (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     server_id VARCHAR(32) NOT NULL REFERENCES servers(id),
     char_name VARCHAR(64) NOT NULL,
-    race VARCHAR(4) CHECK (race IN ('CH', 'EU', 'UNK')),
+    race VARCHAR(4) NOT NULL DEFAULT 'UNK' CHECK (race IN ('CH', 'EU', 'UNK')),
     first_seen_at TIMESTAMPTZ NOT NULL,
     last_seen_at TIMESTAMPTZ NOT NULL,
     CONSTRAINT uq_char_per_server UNIQUE (server_id, char_name)
@@ -438,15 +506,22 @@ CREATE TABLE guild_snapshots (
     extra_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT pk_guild_snapshots PRIMARY KEY (id, created_at)
+    CONSTRAINT pk_guild_snapshots PRIMARY KEY (id, created_at),
+    CONSTRAINT uq_guild_snapshot_run UNIQUE (scrape_run_id, guild_id, created_at)
 ) PARTITION BY RANGE (created_at);
 
--- Partições Iniciais por Mês
+-- Partições Iniciais por Mês + Partição DEFAULT de Segurança
 CREATE TABLE character_snapshots_2026_11 PARTITION OF character_snapshots
     FOR VALUES FROM ('2026-11-01 00:00:00+00') TO ('2026-12-01 00:00:00+00');
+CREATE TABLE character_snapshots_2026_12 PARTITION OF character_snapshots
+    FOR VALUES FROM ('2026-12-01 00:00:00+00') TO ('2027-01-01 00:00:00+00');
+CREATE TABLE character_snapshots_default PARTITION OF character_snapshots DEFAULT;
 
 CREATE TABLE guild_snapshots_2026_11 PARTITION OF guild_snapshots
     FOR VALUES FROM ('2026-11-01 00:00:00+00') TO ('2026-12-01 00:00:00+00');
+CREATE TABLE guild_snapshots_2026_12 PARTITION OF guild_snapshots
+    FOR VALUES FROM ('2026-12-01 00:00:00+00') TO ('2027-01-01 00:00:00+00');
+CREATE TABLE guild_snapshots_default PARTITION OF guild_snapshots DEFAULT;
 
 -- Índices Especializados
 CREATE INDEX idx_char_snapshots_lookup 
@@ -457,18 +532,43 @@ CREATE INDEX idx_char_snapshots_brin_time
     ON character_snapshots USING BRIN (created_at);
 CREATE INDEX idx_char_snapshots_extra_metrics 
     ON character_snapshots USING GIN (extra_metrics);
+
+CREATE INDEX idx_guild_snapshots_lookup 
+    ON guild_snapshots (server_id, guild_id, created_at DESC);
+CREATE INDEX idx_guild_snapshots_rank 
+    ON guild_snapshots (server_id, created_at, rank_position);
+CREATE INDEX idx_guild_snapshots_brin_time 
+    ON guild_snapshots USING BRIN (created_at);
 ```
 
-* **Rotina de Pré-Resolução de Dimensões em Lote:**
-  Antes da inserção em massa nas tabelas de fatos, o worker resolve as chaves estrangeiras executando upsert em lote:
+* **Provisionamento Automático de Partições Mensais (`ensure_monthly_partitions`):**
+  Antes de persistir qualquer snapshot (ou no início de cada `scheduled_12h_flow` via `ensure_partitions_task`), o módulo `src/core/database.py` executa DDL idempotente (`CREATE TABLE IF NOT EXISTS {table}_{YYYY}_{MM} PARTITION OF {table} FOR VALUES FROM (...) TO (...)`) garantindo que as partições do **mês corrente** e do **próximo mês** (`NOW() + INTERVAL '1 month'`) existam antes que qualquer linha caia na partição `DEFAULT`.
+* **Rotina de Pré-Resolução de Dimensões e Inserção em Massa (SQLAlchemy 2.0 Async Core):**
+  Antes da inserção em massa nas tabelas de fatos, o worker resolve as chaves estrangeiras de guildas (unindo guildas vistas em `RawGuildRankingItem` e em `RawPlayerRankingItem.guild_name`) e de personagens em lote:
   ```sql
+  -- 1. Upsert de Guildas (preserva master_char_name quando descoberto via Player Ranking)
+  INSERT INTO guilds (server_id, guild_name, master_char_name, first_seen_at, last_seen_at, is_active)
+  VALUES (:server_id, :guild_name, :master_char_name, :now, :now, TRUE)
+  ON CONFLICT (server_id, guild_name)
+  DO UPDATE SET
+      master_char_name = COALESCE(EXCLUDED.master_char_name, guilds.master_char_name),
+      last_seen_at = EXCLUDED.last_seen_at,
+      is_active = TRUE
+  RETURNING id, guild_name;
+
+  -- 2. Upsert de Personagens (normaliza race None -> 'UNK' e atualiza se antes era 'UNK')
   INSERT INTO characters (server_id, char_name, race, first_seen_at, last_seen_at)
-  VALUES (:server_id, :char_name, :race, :now, :now)
+  VALUES (:server_id, :char_name, COALESCE(:race, 'UNK'), :now, :now)
   ON CONFLICT (server_id, char_name) 
-  DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at
+  DO UPDATE SET
+      race = CASE
+          WHEN EXCLUDED.race IN ('CH', 'EU') THEN EXCLUDED.race
+          ELSE characters.race
+      END,
+      last_seen_at = EXCLUDED.last_seen_at
   RETURNING id, char_name;
   ```
-  O retorno alimenta um mapa em memória (`char_name -> character_id`) que substitui as strings pelos UUIDs respectivos, viabilizando a persistência dos snapshots via `bulk_insert_mappings` ou `COPY` em menos de 500ms.
+  Os retornos alimentam mapas em memória (`guild_name -> guild_id` e `char_name -> character_id`) que substituem as strings pelos UUIDs respectivos. Os fatos são inseridos via SQLAlchemy 2.0 Core Async (`await session.execute(insert(CharacterSnapshot), character_mappings)` e `await session.execute(insert(GuildSnapshot), guild_mappings)`), fatiados em chunks de até 1.000 registros para respeitar o limite de parâmetros posicionais do `asyncpg` e concluir em menos de 500ms.
 
 ### 6. Camada Analítica SQL (Views Nativas)
 
@@ -577,7 +677,7 @@ CREATE OR REPLACE VIEW v_guild_turnover_dominance AS
 WITH latest_runs AS (
     SELECT DISTINCT ON (server_id) id, server_id, created_at
     FROM scrape_runs
-    WHERE status = 'SUCCESS'
+    WHERE status IN ('SUCCESS', 'PARTIAL_SUCCESS')
     ORDER BY server_id, created_at DESC
 ),
 top_players AS (
@@ -608,7 +708,7 @@ CREATE OR REPLACE VIEW v_race_balance_ch_vs_eu AS
 WITH latest_runs AS (
     SELECT DISTINCT ON (server_id) id, server_id, created_at
     FROM scrape_runs
-    WHERE status = 'SUCCESS'
+    WHERE status IN ('SUCCESS', 'PARTIAL_SUCCESS')
     ORDER BY server_id, created_at DESC
 )
 SELECT 
@@ -734,12 +834,13 @@ Esta seção descreve todas as alterações e arquivos que serão criados ou atu
 
 ### Target Files to Create/Modify
 
-#### 1. `docker-compose.yml` (Create)
-*   **Type / Scope:** Infraestrutura / Orquestração de Containers.
+#### 1. `docker-compose.yml` & `.env.example` (Create)
+*   **Type / Scope:** Infraestrutura / Orquestração de Containers e Template de Variáveis.
 *   **Proposed Changes:**
-    *   Definir serviço `postgres` (imagem `postgres:16-alpine`), portas internas, volume `postgres_data`, variáveis de ambiente e healthcheck via `pg_isready`.
+    *   Definir serviço `postgres` (imagem `postgres:16-alpine`), `mem_limit: 1g`, flags de comando `-c shared_buffers=512MB -c work_mem=64MB`, rede interna `sro_network`, volume `postgres_data`, variáveis de ambiente obrigatórias (`${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}`, sem senha padrão hardcoded) e healthcheck via `pg_isready`.
     *   Definir serviço `prefect-server` (imagem `prefecthq/prefect:3-python3.11`), comando `prefect server start --host 0.0.0.0`, expondo porta `4200` e volume para dados do Prefect.
-    *   Definir serviço `scraper-worker` construído a partir do `Dockerfile` local, configurado com `depends_on` condicional ao healthcheck do `postgres` e `prefect-server`, montando o volume `./quarantine:/app/quarantine` e configurando `PREFECT_API_URL=http://prefect-server:4200/api`.
+    *   Definir serviço `scraper-worker` construído a partir do `Dockerfile` local, com teto estrito de memória `mem_limit: 512m`, comando `sh -c "alembic upgrade head && exec python -m src.flows.orchestrator --mode serve"`, `healthcheck` (`test -w /app/quarantine && kill -0 1`), configurado com `depends_on` condicional ao healthcheck do `postgres` e `prefect-server`, montando o volume `./quarantine:/app/quarantine` e configurando `PREFECT_API_URL=http://prefect-server:4200/api`.
+    *   Fornecer `.env.example` documentando todas as variáveis de ambiente esperadas (`POSTGRES_*`, `DATABASE_URL`, `PREFECT_API_URL`, `LOG_LEVEL`, `QUARANTINE_*`, `CIRCUIT_BREAKER_COOLDOWN_HOURS`, `ELECTUS_CF_CLEARANCE`).
 
 #### 2. `Dockerfile` (Create)
 *   **Type / Scope:** Infraestrutura / Build do Scraper.
@@ -747,13 +848,14 @@ Esta seção descreve todas as alterações e arquivos que serão criados ou atu
     *   Imagem base `python:3.11-slim`.
     *   Instalação de pacotes essenciais do sistema operacional (`curl`, `gcc`, `libpq-dev`).
     *   Instalação e configuração do gerenciador de dependências (`uv` ou `pip`).
-    *   Cópia do código-fonte para `/app`, configuração de `PYTHONPATH=/app/src` e usuário não-root para execução segura.
+    *   Cópia do código-fonte para `/app`, configuração de `PYTHONPATH=/app` e usuário não-root para execução segura.
 
-#### 3. `pyproject.toml` (Create)
-*   **Type / Scope:** Gerenciamento de Dependências do Projeto.
+#### 3. `pyproject.toml` (Create / Modify)
+*   **Type / Scope:** Gerenciamento de Dependências e Configuração de Ferramentas de Qualidade.
 *   **Proposed Changes:**
     *   Dependências de produção: `prefect>=3.0.0`, `sqlalchemy>=2.0.0`, `asyncpg>=0.29.0`, `psycopg[binary]>=3.1.0`, `pydantic>=2.7.0`, `pydantic-settings>=2.2.0`, `httpx[http2]>=0.27.0`, `beautifulsoup4>=4.12.0`, `lxml>=5.2.0`, `orjson>=3.10.0`, `structlog>=24.1.0`, `alembic>=1.13.0`.
-    *   Dependências de teste e qualidade: `pytest>=8.0.0`, `pytest-asyncio>=0.23.0`, `respx>=0.21.0`, `ruff>=0.4.0`.
+    *   Dependências de teste e qualidade (`[dependency-groups] dev`, PEP 735): `pytest>=8.0.0`, `pytest-asyncio>=0.23.0`, `pytest-cov>=5.0.0`, `respx>=0.21.0`, `ruff>=0.4.0`, `mypy>=1.10.0`, `types-beautifulsoup4`, `lxml-stubs`.
+    *   Configuração estrita das ferramentas no `pyproject.toml`: `[tool.ruff]` (`line-length = 100`, `target-version = "py311"`), `[tool.mypy]` (`python_version = "3.11"`, `strict = true`, `plugins = ["pydantic.mypy"]`) e `[tool.pytest.ini_options]` (`asyncio_mode = "auto"`).
 
 #### 4. `alembic.ini` & `alembic/env.py` (Create)
 *   **Type / Scope:** Migrações de Banco de Dados.
@@ -761,12 +863,13 @@ Esta seção descreve todas as alterações e arquivos que serão criados ou atu
     *   Configuração do mecanismo de migração Alembic para conectar via `DATABASE_URL` do ambiente e carregar os metadados dos modelos SQLAlchemy 2.0.
 
 #### 5. `alembic/versions/001_initial_schema.py` (Create)
-*   **Type / Scope:** DDL do PostgreSQL 16.
+*   **Type / Scope:** DDL do PostgreSQL 16 & Seed Inicial.
 *   **Proposed Changes:**
-    *   Criação das tabelas de dimensão: `servers` (com `circuit_breaker_until`), `characters` (com `race`), `guilds`.
-    *   Criação da tabela de auditoria: `scrape_runs` com enum restrito de status.
-    *   Criação das tabelas de fatos particionadas: `character_snapshots` e `guild_snapshots` com `PARTITION BY RANGE (created_at)`, `PRIMARY KEY (id, created_at)` e índices especializados (B-Tree, BRIN, GIN).
-    *   Criação de partições iniciais mensais.
+    *   Criação das tabelas de dimensão: `servers` (com `circuit_breaker_until`), `characters` (com `race NOT NULL DEFAULT 'UNK'`), `guilds`.
+    *   Seed inicial idempotente (`INSERT INTO servers ... ON CONFLICT (id) DO NOTHING`) para `'chronicle'`, `'electus'` e `'play_golden'`.
+    *   Criação da tabela de auditoria: `scrape_runs` com enum restrito de status e colunas de quarentena (`quarantine_file_path`, `quarantine_sha256`, `quarantine_size_bytes`, `error_details`).
+    *   Criação das tabelas de fatos particionadas: `character_snapshots` e `guild_snapshots` com `PARTITION BY RANGE (created_at)`, `PRIMARY KEY (id, created_at)`, constraints `UNIQUE` por run e índices especializados (B-Tree, BRIN, GIN).
+    *   Criação das partições iniciais mensais (`2026_11`, `2026_12`) e partição `DEFAULT` de segurança para ambas as tabelas de fatos.
 
 #### 6. `alembic/versions/002_analytical_views.py` (Create)
 *   **Type / Scope:** DDL de Views Analíticas.
@@ -776,12 +879,13 @@ Esta seção descreve todas as alterações e arquivos que serão criados ou atu
 #### 7. `src/core/config.py` (Create)
 *   **Type / Scope:** Módulo Core de Configuração.
 *   **Proposed Changes:**
-    *   Classe `Settings` baseada em `pydantic-settings` carregando variáveis `.env`: `DATABASE_URL` (`postgresql+asyncpg://`), `PREFECT_API_URL` (`http://prefect-server:4200/api`), `LOG_LEVEL`, `QUARANTINE_DIR` (`./quarantine`), `CIRCUIT_BREAKER_COOLDOWN_HOURS` (`6`).
+    *   Classe `Settings` baseada em `pydantic-settings` carregando variáveis `.env`: `DATABASE_URL` (`postgresql+asyncpg://` em produção; aceita também esquemas `sqlite` exclusivamente para testes locais), `PREFECT_API_URL` (default local `http://localhost:4200/api`, sobrescrito para `http://prefect-server:4200/api` no `docker-compose.yml` e `.env.example`), `LOG_LEVEL`, `QUARANTINE_DIR` (`./quarantine`), `QUARANTINE_RETENTION_DAYS` (`30`), `CIRCUIT_BREAKER_COOLDOWN_HOURS` (`6`), `ELECTUS_CF_CLEARANCE` (`Optional[str] = None`).
 
 #### 8. `src/core/database.py` (Create)
-*   **Type / Scope:** Módulo de Conexão com o Banco.
+*   **Type / Scope:** Módulo de Conexão com o Banco & Provisionamento de Partições.
 *   **Proposed Changes:**
-    *   Configuração do `create_async_engine` com `asyncpg` e `async_sessionmaker` para execução de queries e bulk inserts de alta performance.
+    *   Configuração do `create_async_engine` com `asyncpg` e `async_sessionmaker` (com suporte auxiliar ao dialeto `sqlite` restrito à suíte de testes).
+    *   Função assíncrona `ensure_monthly_partitions(session: AsyncSession, reference_time: datetime)` que cria idempotentemente (`CREATE TABLE IF NOT EXISTS ... PARTITION OF ...`) as partições mensais do mês atual e do mês seguinte para `character_snapshots` e `guild_snapshots`.
 
 #### 9. `src/core/logging.py` (Create)
 *   **Type / Scope:** Módulo de Telemetria e Logs.
@@ -791,63 +895,78 @@ Esta seção descreve todas as alterações e arquivos que serão criados ou atu
 #### 10. `src/models/pydantic_schemas.py` (Create)
 *   **Type / Scope:** Contratos de Validação de Dados.
 *   **Proposed Changes:**
-    *   Implementação dos modelos `RawPlayerRankingItem`, `RawJobRankingItem` e `RawGuildRankingItem` conforme especificação da seção 4 (com validadores `normalize_empty_strings`, `normalize_race`, `normalize_job_type`, `clean_int_numbers`, `clean_float_numbers` e dicionário dinâmico `extra_metrics`).
+    *   Implementação dos modelos `RawPlayerRankingItem`, `RawJobRankingItem` e `RawGuildRankingItem` conforme especificação da Seção 4 (com tratamento determinístico de separadores de milhar/decimal em `clean_float_numbers`, validadores `normalize_empty_strings`, `normalize_race`, `normalize_job_type`, `clean_int_numbers` e dicionário dinâmico `extra_metrics`).
 
 #### 11. `src/models/db_models.py` (Create)
 *   **Type / Scope:** Modelos Declarativos ORM (SQLAlchemy 2.0).
 *   **Proposed Changes:**
-    *   Mapeamento das entidades relacionais (`Server`, `Character`, `Guild`, `ScrapeRun`, `CharacterSnapshot`, `GuildSnapshot`) utilizando `Mapped[...]` do SQLAlchemy 2.0.
+    *   Mapeamento das entidades relacionais (`Server`, `Character`, `Guild`, `ScrapeRun`, `CharacterSnapshot`, `GuildSnapshot`) utilizando `Mapped[...]` e `mapped_column(...)` compatíveis com `mypy --strict`.
 
-#### 12. `src/scrapers/base.py` (Create)
-*   **Type / Scope:** Motor Base de Extração.
+#### 12. `src/scrapers/base.py` & `src/scrapers/__init__.py` (Create)
+*   **Type / Scope:** Motor Base de Extração, Reconciliação, Registro e Persistência.
 *   **Proposed Changes:**
     *   Implementação da classe abstrata `BaseRankingScraper`:
-        *   Consulta e respeito ao `servers.circuit_breaker_until` antes de qualquer chamada HTTP.
-        *   Sessão `httpx.AsyncClient` com HTTP/2 e rotação determinística de headers.
-        *   Top-Rank Integrity Guard e validação de schema drift contra Pydantic v2.
-        *   Módulo de quarentena com compressão `.html.gz` em `./quarantine/{server_id}/{run_id}.html.gz`.
-        *   Auditoria e persistência de ciclo de vida na tabela `scrape_runs`.
+        *   Consulta e respeito ao `servers.circuit_breaker_until` antes de qualquer chamada HTTP (retornando `ScrapeRunSummary(status="SKIPPED_CIRCUIT_BREAKER", skipped=True)` sem gravar linha em `scrape_runs` durante o cooldown).
+        *   Sessão `httpx.AsyncClient` com HTTP/2, sonda inicial em `player` seguida de execução concorrente de `job` e `guild` via `asyncio.TaskGroup` limitada por `asyncio.Semaphore(3)`, rotação determinística de headers e retries restritos a falhas transitórias de transporte/502/503/504 (máx 2 retries).
+        *   Deduplicação em memória (menor `rank` por `char_name` / `guild_name`), reconciliação em memória de `RawJobRankingItem` sobre `RawPlayerRankingItem` por `char_name` (incluindo fallback de `guild_name` e preservação de `job_exp`) e truncamento seguro de strings aos limites de coluna do banco.
+        *   Top-Rank Integrity Guard (posições 1–3), cálculo da taxa de erro (<= 5% -> `PARTIAL_SUCCESS`, > 5% -> `SCHEMA_DRIFT`) e validação de contagem mínima (`min_records_expected` -> `LOW_COUNT_QUARANTINE`).
+        *   Módulo de quarentena com banners HTML por página e compressão `.html.gz` em `./quarantine/{server_id}/{run_id}.html.gz`, cálculo de SHA-256 sobre os bytes compactados e tamanho em bytes.
+        *   Pré-resolução de dimensões (`guilds` e `characters`) via `INSERT ... ON CONFLICT DO UPDATE RETURNING` e inserção em lote via `await session.execute(insert(...), mappings)` em chunks de até 1.000 linhas.
+        *   Auditoria completa na tabela `scrape_runs`.
+    *   Registry e factory em `src/scrapers/__init__.py` (`_SCRAPER_REGISTRY` e `get_scraper(server_id, settings)`).
 
 #### 13. `src/scrapers/chronicle.py` (Create)
 *   **Type / Scope:** Parser Específico do Servidor Chronicle SRO.
 *   **Proposed Changes:**
-    *   Implementação do `ChronicleScraper` especializado no parsing HTML da tabela em `play-chronicle.com/ranking/index.html` via `lxml`.
+    *   Implementação do `ChronicleScraper` para `https://play-chronicle.com` (`/ranking/player`, `/ranking/job`, `/ranking/guild`) usando `lxml` com seletor `table.ranking-table tbody tr` conforme tabela de mapeamento da Seção 3.
 
 #### 14. `src/scrapers/electus.py` (Create)
 *   **Type / Scope:** Parser Específico do Servidor Electus Online.
 *   **Proposed Changes:**
-    *   Implementação do `ElectusScraper` com suporte a endpoints JSON (`/api/...`), suporte a injeção manual de sessão (`cf_clearance` via `.env`) e ativação do Circuit Breaker em caso de desafio Turnstile.
+    *   Implementação do `ElectusScraper` para `https://electus.online` consumindo os endpoints JSON `/api/ranking/{player,job,guild}` via `orjson` (com fallback HTML para `table#ranking-table tbody tr`), injeção opcional de cookie `cf_clearance` (`ELECTUS_CF_CLEARANCE`) e ativação imediata do Circuit Breaker em caso de desafio Turnstile.
 
 #### 15. `src/scrapers/golden.py` (Create)
 *   **Type / Scope:** Parser Específico do Servidor Play Golden.
 *   **Proposed Changes:**
-    *   Implementação do `PlayGoldenScraper` com parsing de rankings de jogadores e jobs para a estrutura de `play-golden.online/ranking.html`.
+    *   Implementação do `PlayGoldenScraper` para `https://play-golden.online` (`/ranking/characters`, `/ranking/jobs`, `/ranking/guilds`) via `lxml` (`table.table-ranking tbody tr`) conforme tabela de mapeamento da Seção 3.
 
 #### 16. `src/flows/tasks.py` (Create)
 *   **Type / Scope:** Tasks Prefect 3.
 *   **Proposed Changes:**
-    *   Definição de tasks isoladas `@task(retries=3, retry_delay_seconds=30)`: `scrape_target_task`, `resolve_dimensions_task`, `persist_snapshots_task`.
+    *   Fallback defensivo `_ensure_accessible_prefect_home()` no carregamento do módulo para redirecionar `PREFECT_HOME` para diretório temporário caso `~/.prefect` não seja acessível (ex.: containers restritos ou ambientes de teste).
+    *   Definição de tasks Prefect (`@task(retries=0)` para evitar duplicação de `scrape_runs` e respeitar o Circuit Breaker):
+        *   `ensure_partitions_task()`: Invoca `ensure_monthly_partitions` para garantir partições do mês atual e seguinte.
+        *   `scrape_target_task(server_id: str, trigger_type: str)`: Instancia o scraper correspondente ao `server_id` via `get_scraper()` e executa o pipeline completo (extração, reconciliação, validação, quarentena/persistência).
+        *   `purge_old_quarantine_task(retention_days: int = 30)`: Remove arquivos `.html.gz` em `./quarantine` com `mtime` superior a 30 dias.
 
 #### 17. `src/flows/orchestrator.py` (Create)
-*   **Type / Scope:** Flows Prefect 3.
+*   **Type / Scope:** Flows Prefect 3 & CLI Entrypoint.
 *   **Proposed Changes:**
-    *   `scheduled_12h_flow`: Flow principal disparado via Cron a cada 12 horas, executando sub-tasks para cada um dos servidores com isolamento de falha.
-    *   Deployments dedicados pós-FW por servidor: parametrizados por `servers.fw_day_of_week` e `servers.fw_end_time_utc`.
+    *   Fallback defensivo `_ensure_accessible_prefect_home()` no carregamento do módulo.
+    *   `scheduled_12h_flow()`: Executa `ensure_partitions_task()`, dispara `scrape_target_task` para todos os servidores ativos com isolamento de falhas (`return_state=True`) e executa `purge_old_quarantine_task()`.
+    *   `post_fw_flow(server_id: str)`: Executa `ensure_partitions_task()` e `scrape_target_task(server_id=server_id, trigger_type="post_fw_extra")`.
+    *   `manual_scrape_flow(target: str = "all")`: Flow Prefect (`manual-scrape-flow`) para execução sob demanda via CLI (`--mode manual`), suportando `'all'` (com isolamento por servidor) ou um `server_id` específico.
+    *   CLI via `argparse` no bloco `if __name__ == "__main__":`:
+        *   `--mode serve`: Lê os servidores ativos do banco, constrói o deployment `scheduled-12h` (`cron="0 0,12 * * *"`) e os deployments `post-fw-{server_id}` (30 min após `fw_end_time_utc` no `fw_day_of_week`) e inicia `prefect.serve(...)`.
+        *   `--mode manual --target <all|chronicle|electus|play_golden>`: Executa imediatamente `manual_scrape_flow` para o(s) alvo(s) especificado(s) com `trigger_type="manual"`.
 
-#### 18. `tests/test_parsers.py` (Create)
-*   **Type / Scope:** Testes Unitários de Extração.
+#### 18. `tests/test_parsers.py` & `tests/fixtures/` (Create)
+*   **Type / Scope:** Testes Unitários de Extração e Reconciliação.
 *   **Proposed Changes:**
-    *   Testes com fixtures estáticas gravadas em HTML/JSON simulando respostas reais dos servidores Chronicle, Electus e Play Golden para validar a precisão dos seletores.
+    *   Fixtures estáticas em `tests/fixtures/` (`chronicle_player.html`, `chronicle_job.html`, `chronicle_guild.html`, `electus_player.json`, `electus_turnstile_403.html`, `golden_player.html`, etc.) validando parsing, reconciliação `Job -> Player` e detecção de bloqueio Turnstile sem chamadas de rede reais.
 
-#### 19. `tests/test_validation.py` (Create)
-*   **Type / Scope:** Testes Unitários de Contrato.
+#### 19. `tests/test_validation.py`, `tests/test_models_db.py`, `tests/test_flows.py` & `tests/e2e/` (Create)
+*   **Type / Scope:** Testes Unitários de Contrato, Persistência, Orquestração e Suíte E2E.
 *   **Proposed Changes:**
-    *   Testes de validação Pydantic v2 simulando dados corrompidos, ativação de quarentena, top-rank guard e cálculo de taxa de erro de schema drift.
+    *   `tests/test_validation.py`: Testes de validação Pydantic v2 cobrindo normalização de floats/inteiros, dados corrompidos, Top-Rank Integrity Guard (posições 1–3), limiar de 5% (`PARTIAL_SUCCESS` vs `SCHEMA_DRIFT`), `LOW_COUNT_QUARANTINE`, geração de `.html.gz` com hash SHA-256 e concorrência controlada por `asyncio.Semaphore(3)`.
+    *   `tests/test_models_db.py`: Testes unitários dos modelos ORM SQLAlchemy 2.0, configuração (`Settings`) e helpers de banco/particionamento (`src/core/database.py`).
+    *   `tests/test_flows.py`: Testes unitários das tasks Prefect, cálculo de cron pós-FW (`compute_post_fw_cron`), isolamento de falhas nos flows (`scheduled_12h_flow`, `post_fw_flow`, `manual_scrape_flow`) e CLI (`orchestrator.py`).
+    *   `tests/e2e/`: Suíte end-to-end em camadas (`_contracts.py`, `_loader.py`, `conftest.py`, `helpers/`, `test_tier1_features.py`–`test_tier4_scenarios.py`) cobrindo contratos de containerização, migrações, views analíticas e cenários de runtime.
 
 #### 20. `README.md` (Modify)
 *   **Type / Scope:** Documentação Operacional do Projeto.
 *   **Proposed Changes:**
-    *   Atualizar com instruções de inicialização do Docker Compose, execução das migrações Alembic, verificação da UI do Prefect e exemplos de consultas SQL nas views analíticas.
+    *   Atualizar com instruções de inicialização do Docker Compose, execução das migrações Alembic, uso da CLI (`--mode serve` e `--mode manual`), verificação da UI do Prefect e exemplos de consultas SQL nas views analíticas.
 
 --------------------------------------------------------------------------------
 
@@ -855,24 +974,27 @@ Esta seção descreve todas as alterações e arquivos que serão criados ou atu
 
 ### 1. Build & Containerização
 *   Executar `docker compose build` e garantir que o build da imagem Python 3.11 ocorra sem falhas ou warnings críticos.
-*   Executar `docker compose up -d` e verificar se `postgres`, `prefect-server` e `scraper-worker` atingem status `healthy`.
+*   Executar `docker compose up -d` e verificar se `postgres` (`mem_limit: 1g`), `prefect-server` e `scraper-worker` (`mem_limit: 512m`) atingem status `healthy`.
 
 ### 2. Migrações de Banco de Dados
-*   Executar `alembic upgrade head` dentro do container e verificar a criação correta de todas as tabelas, partições, índices (B-Tree, BRIN, GIN) e views SQL.
+*   Executar `alembic upgrade head` e verificar a criação correta de todas as tabelas, seed inicial dos 3 servidores em `servers`, partições mensais (`2026_11`, `2026_12` e `DEFAULT`), índices (B-Tree, BRIN, GIN) e as 5 views SQL.
 
-### 3. Testes Automatizados (Pytest)
-*   Executar a suíte de testes com cobertura:
+### 3. Gate de Qualidade de Código, Tipagem e Testes Automatizados (Ruff, Mypy, Pytest)
+*   Executar o checklist obrigatório de verificação definido em `AGENTS.md`:
     ```sh
+    ruff check .
+    ruff format --check .
+    mypy src tests
     pytest --cov=src tests/
     ```
-    *   Critério de aprovação: 100% dos testes unitários de parsers e validação Pydantic v2 passando com sucesso.
+    *   Critério de aprovação: Zero erros de lint/formatação no Ruff, zero erros de tipagem no `mypy --strict` e 100% dos testes unitários passando no Pytest.
 
 ### 4. Teste de Ingestão E2E (Mock & Alvo Real)
 *   Executar disparo manual do flow:
     ```sh
     python -m src.flows.orchestrator --mode manual --target chronicle
     ```
-    *   Critério de aprovação: Gravação bem-sucedida de registro com status `SUCCESS` em `scrape_runs`, população de registros em `character_snapshots` e validação de consulta com retorno consistente na view `v_character_activity_deltas`.
+    *   Critério de aprovação: Gravação bem-sucedida de registro com status `SUCCESS` (ou `PARTIAL_SUCCESS`) em `scrape_runs`, população de registros em `character_snapshots` e `guild_snapshots`, e validação de consulta com retorno consistente na view `v_character_activity_deltas`.
 
 --------------------------------------------------------------------------------
 

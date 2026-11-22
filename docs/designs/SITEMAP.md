@@ -6,7 +6,7 @@
 
 | Document | Date | Author | Components | Description | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| [001_sro_ranking_scraper_pipeline.md](001_sro_ranking_scraper_pipeline.md) | 2026-11-18 | richardman13 | Scrapers, Prefect 3, PostgreSQL 16, Pydantic v2, Alembic | Pipeline containerizado append-only de extração de rankings de Silkroad Online com views analíticas de séries temporais | Approved |
+| [001_sro_ranking_scraper_pipeline.md](001_sro_ranking_scraper_pipeline.md) | 2026-11-18 | richardman13 | Scrapers, Prefect 3, PostgreSQL 16, Pydantic v2, Alembic | Pipeline containerizado append-only de extração de rankings de Silkroad Online com views analíticas de séries temporais | Implemented |
 
 ## Status Legend
 
@@ -20,4 +20,4 @@
 
 Os relatórios de revisão crítica gerados durante o refinamento de cada design são preservados em `docs/egm/` para rastreabilidade histórica:
 
-- **Design 001**: [docs/egm/001_sro_ranking_scraper/](../egm/001_sro_ranking_scraper/) (`design_draft.md`, `critic_report.md`, `comprehension_report.md`, `zoom_out_report.md`, `goldfish_review_report.md`)
+- **Design 001**: [docs/egm/001_sro_ranking_scraper/](../egm/001_sro_ranking_scraper/) (`design_draft.md`, `critic_report.md`, `comprehension_report.md`, `zoom_out_report.md`, `goldfish_review_report.md`, `2026-11-22_DRIFT_REPORT.md`)
