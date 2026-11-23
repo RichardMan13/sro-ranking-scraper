@@ -20,6 +20,8 @@ _LOG_LEVELS: dict[str, int] = {
 def configure_logging(log_level: str = "INFO") -> None:
     """Configure structlog for structured JSON output to stdout."""
     level = _LOG_LEVELS.get(log_level.strip().upper(), logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,

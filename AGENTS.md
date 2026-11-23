@@ -61,23 +61,24 @@ Este arquivo define as regras obrigatórias para qualquer agente de execução (
 
 ## 4. Padrões de Código e Checklist de Verificação
 
+- **Execução obrigatória via `uv run`:** Todo comando Python ou ferramenta do projeto (`python`, `pytest`, `ruff`, `mypy`, `alembic`, etc.) deve ser executado via `uv run` (use `uv run --no-sync` em execuções locais/offline quando o `.venv` já estiver sincronizado, para evitar tentativas de acesso ao PyPI). Nunca invoque o `python` global do sistema/Conda.
 - Todo código Python deve possuir tipagem estática completa compatível com `mypy --strict`.
 - Toda lógica de parsing e validação deve ter cobertura de testes unitários usando fixtures estáticas em `tests/fixtures/` (sem chamadas de rede reais nos testes unitários).
 - **Gate obrigatório antes de concluir qualquer tarefa:**
 
 ```bash
 # 1. Lint e formatação (Ruff)
-ruff check .
-ruff format --check .
+uv run --no-sync ruff check .
+uv run --no-sync ruff format --check .
 
 # 2. Verificação de tipos estrita (Mypy)
-mypy src tests
+uv run --no-sync mypy src tests
 
 # 3. Suíte de testes unitários e cobertura (Pytest)
-pytest --cov=src tests/
+uv run --no-sync pytest --cov=src tests/
 
 # 4. Migrações de banco de dados (quando houver alterações de schema/views)
-alembic upgrade head
+uv run --no-sync alembic upgrade head
 ```
 
 > Nenhuma tarefa deve ser considerada concluída se qualquer um dos comandos aplicáveis acima falhar.

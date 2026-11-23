@@ -7,7 +7,7 @@ import tempfile
 import time as pytime
 import uuid
 from collections.abc import Sequence
-from datetime import time
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,7 +20,9 @@ import asyncio  # noqa: E402
 import pytest  # noqa: E402
 from prefect.client.schemas.schedules import CronSchedule  # noqa: E402
 from prefect.states import Completed, Failed  # noqa: E402
+from pydantic import SecretStr  # noqa: E402
 from src.core.config import Settings  # noqa: E402
+from src.core.notifications import PostFWComparison  # noqa: E402
 from src.flows import orchestrator, tasks  # noqa: E402
 from src.models.db_models import Server  # noqa: E402
 from src.scrapers.base import ScrapeRunSummary  # noqa: E402
@@ -28,7 +30,12 @@ from src.scrapers.base import ScrapeRunSummary  # noqa: E402
 from tests.test_validation import _run_async  # noqa: E402
 
 
-def _make_test_settings(tmp_path: Path | None = None) -> Settings:
+def _make_test_settings(
+    tmp_path: Path | None = None,
+    *,
+    discord_ops_webhook_url: str | None = None,
+    discord_community_webhook_url: str | None = None,
+) -> Settings:
     qdir = (tmp_path / "quarantine") if tmp_path is not None else Path("./quarantine")
     return Settings(
         _env_file=None,
@@ -38,6 +45,14 @@ def _make_test_settings(tmp_path: Path | None = None) -> Settings:
         quarantine_dir=qdir,
         quarantine_retention_days=30,
         circuit_breaker_cooldown_hours=6,
+        discord_ops_webhook_url=(
+            SecretStr(discord_ops_webhook_url) if discord_ops_webhook_url is not None else None
+        ),
+        discord_community_webhook_url=(
+            SecretStr(discord_community_webhook_url)
+            if discord_community_webhook_url is not None
+            else None
+        ),
     )
 
 
@@ -220,6 +235,45 @@ def test_scrape_target_task_runs_scraper_and_disposes_engine(
     assert summary == expected
     assert recorded_calls == [("chronicle", "manual")]
     assert engine.disposed is True
+
+
+def test_scrape_target_task_notifies_ops_after_engine_dispose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_test_settings(
+        discord_ops_webhook_url="https://discord.com/api/webhooks/111/ops_token"
+    )
+    session = _DummySession()
+    engine = _DummyEngine()
+    expected = _make_summary("electus", status="BLOCKED_CHALLENGE", trigger_type="manual")
+    events: list[str] = []
+
+    class _FakeScraper:
+        async def run(self, sess: Any, trigger_type: str = "scheduled_12h") -> ScrapeRunSummary:
+            events.append("scrape")
+            return expected
+
+    async def fake_dispose() -> None:
+        engine.disposed = True
+        events.append("dispose")
+
+    async def fake_notify(summary: ScrapeRunSummary, *, settings: Settings) -> bool:
+        assert engine.disposed is True
+        assert summary == expected
+        events.append("notify_ops")
+        return False
+
+    monkeypatch.setattr(engine, "dispose", fake_dispose)
+    monkeypatch.setattr(tasks, "get_settings", lambda: settings)
+    monkeypatch.setattr(tasks, "get_scraper", lambda sid, settings: _FakeScraper())
+    monkeypatch.setattr(tasks, "create_engine_from_url", lambda url: engine)
+    monkeypatch.setattr(tasks, "create_session_factory", lambda eng: _DummySessionFactory(session))
+    monkeypatch.setattr(tasks, "notify_operational_failure", fake_notify)
+
+    summary = _run_async(tasks.scrape_target_task.fn(server_id="electus", trigger_type="manual"))
+
+    assert summary == expected
+    assert events == ["scrape", "dispose", "notify_ops"]
 
 
 def test_scrape_target_task_disposes_engine_on_error(
@@ -453,6 +507,140 @@ def test_post_fw_flow_uses_post_fw_extra_trigger(
 
     assert summary == expected
     assert seen_calls == [("partitions", ""), ("electus", "post_fw_extra")]
+
+
+@pytest.mark.parametrize("status", ["SUCCESS", "PARTIAL_SUCCESS"])
+def test_post_fw_flow_loads_comparison_disposes_engine_then_notifies(
+    status: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_test_settings(
+        discord_community_webhook_url="https://discord.com/api/webhooks/222/community_token"
+    )
+    expected = _make_summary("chronicle", status=status, trigger_type="post_fw_extra")
+    session = _DummySession()
+    engine = _DummyEngine()
+    events: list[str] = []
+    fake_comparison = PostFWComparison(
+        server_id="chronicle",
+        server_display_name="Chronicle SRO",
+        current_run_id=expected.run_id,
+        current_run_at=datetime(2026, 11, 22, 22, 30, tzinfo=UTC),
+        current_status=status,
+        baseline_run_id=None,
+        baseline_run_at=None,
+        current_fortresses={},
+        baseline_fortresses={},
+        current_top_guilds=(),
+        baseline_rank_by_guild={},
+    )
+
+    async def fake_ensure_partitions() -> list[str]:
+        return []
+
+    async def fake_scrape_target_task(*, server_id: str, trigger_type: str) -> ScrapeRunSummary:
+        events.append("scrape")
+        return expected
+
+    async def fake_load_comparison(sess: Any, summary: ScrapeRunSummary) -> PostFWComparison:
+        assert sess is session
+        assert summary == expected
+        events.append("load_comparison")
+        return fake_comparison
+
+    async def fake_dispose() -> None:
+        engine.disposed = True
+        events.append("dispose")
+
+    async def fake_notify(comparison: PostFWComparison | None, *, settings: Settings) -> bool:
+        assert engine.disposed is True
+        assert comparison == fake_comparison
+        events.append("notify_community")
+        return True
+
+    monkeypatch.setattr(engine, "dispose", fake_dispose)
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: settings)
+    monkeypatch.setattr(orchestrator, "ensure_partitions_task", fake_ensure_partitions)
+    monkeypatch.setattr(orchestrator, "scrape_target_task", fake_scrape_target_task)
+    monkeypatch.setattr(orchestrator, "create_engine_from_url", lambda url: engine)
+    monkeypatch.setattr(
+        orchestrator, "create_session_factory", lambda eng: _DummySessionFactory(session)
+    )
+    monkeypatch.setattr(orchestrator, "load_post_fw_comparison", fake_load_comparison)
+    monkeypatch.setattr(orchestrator, "notify_post_fw_summary", fake_notify)
+
+    summary = _run_async(orchestrator.post_fw_flow.fn(server_id="chronicle"))
+
+    assert summary == expected
+    assert events == ["scrape", "load_comparison", "dispose", "notify_community"]
+
+
+def test_post_fw_flow_skips_community_notification_on_failure_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_test_settings(
+        discord_community_webhook_url="https://discord.com/api/webhooks/222/community_token"
+    )
+    expected = _make_summary("electus", status="BLOCKED_CHALLENGE", trigger_type="post_fw_extra")
+
+    async def fake_ensure_partitions() -> list[str]:
+        return []
+
+    async def fake_scrape_target_task(*, server_id: str, trigger_type: str) -> ScrapeRunSummary:
+        return expected
+
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: settings)
+    monkeypatch.setattr(orchestrator, "ensure_partitions_task", fake_ensure_partitions)
+    monkeypatch.setattr(orchestrator, "scrape_target_task", fake_scrape_target_task)
+    monkeypatch.setattr(
+        orchestrator,
+        "create_engine_from_url",
+        lambda _url: (_ for _ in ()).throw(AssertionError("should not open DB")),
+    )
+
+    summary = _run_async(orchestrator.post_fw_flow.fn(server_id="electus"))
+    assert summary == expected
+
+
+def test_post_fw_flow_isolates_db_comparison_errors_and_disposes_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_test_settings(
+        discord_community_webhook_url="https://discord.com/api/webhooks/222/community_token"
+    )
+    expected = _make_summary("chronicle", status="SUCCESS", trigger_type="post_fw_extra")
+    session = _DummySession()
+    engine = _DummyEngine()
+    notify_called_with: list[PostFWComparison | None] = []
+
+    async def fake_ensure_partitions() -> list[str]:
+        return []
+
+    async def fake_scrape_target_task(*, server_id: str, trigger_type: str) -> ScrapeRunSummary:
+        return expected
+
+    async def failing_load(sess: Any, summary: ScrapeRunSummary) -> PostFWComparison | None:
+        raise RuntimeError("db read timeout")
+
+    async def fake_notify(comparison: PostFWComparison | None, *, settings: Settings) -> bool:
+        notify_called_with.append(comparison)
+        return False
+
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: settings)
+    monkeypatch.setattr(orchestrator, "ensure_partitions_task", fake_ensure_partitions)
+    monkeypatch.setattr(orchestrator, "scrape_target_task", fake_scrape_target_task)
+    monkeypatch.setattr(orchestrator, "create_engine_from_url", lambda url: engine)
+    monkeypatch.setattr(
+        orchestrator, "create_session_factory", lambda eng: _DummySessionFactory(session)
+    )
+    monkeypatch.setattr(orchestrator, "load_post_fw_comparison", failing_load)
+    monkeypatch.setattr(orchestrator, "notify_post_fw_summary", fake_notify)
+
+    summary = _run_async(orchestrator.post_fw_flow.fn(server_id="chronicle"))
+
+    assert summary == expected
+    assert engine.disposed is True
+    assert notify_called_with == [None]
 
 
 def test_manual_scrape_flow_single_and_all_targets(

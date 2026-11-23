@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any, Final
 from urllib.parse import urlsplit
 
-from pydantic import Field, PostgresDsn, field_validator
+from pydantic import Field, PostgresDsn, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ALLOWED_DB_SCHEME_RE = re.compile(
     r"^(?:postgres|postgresql(?:\+[a-z0-9_]+)?|sqlite(?:\+[a-z0-9_]+)?)$"
+)
+_DISCORD_WEBHOOK_HOSTS: Final[frozenset[str]] = frozenset(
+    {
+        "discord.com",
+        "discordapp.com",
+        "ptb.discord.com",
+        "canary.discord.com",
+    }
 )
 
 
@@ -19,6 +28,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     database_url: PostgresDsn | str = Field(...)
@@ -28,6 +38,66 @@ class Settings(BaseSettings):
     quarantine_retention_days: int = Field(default=30, ge=1)
     circuit_breaker_cooldown_hours: int = Field(default=6, ge=1)
     electus_cf_clearance: str | None = None
+    discord_ops_webhook_url: SecretStr | None = None
+    discord_community_webhook_url: SecretStr | None = None
+
+    @field_validator(
+        "discord_ops_webhook_url",
+        "discord_community_webhook_url",
+        mode="before",
+    )
+    @classmethod
+    def normalize_discord_webhook_url(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, SecretStr):
+            stripped = value.get_secret_value().strip()
+            return SecretStr(stripped) if stripped else None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped if stripped else None
+        return value
+
+    @field_validator(
+        "discord_ops_webhook_url",
+        "discord_community_webhook_url",
+        mode="after",
+    )
+    @classmethod
+    def validate_discord_webhook_url(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value()
+        try:
+            parsed = urlsplit(raw)
+            _ = parsed.port
+        except ValueError:
+            raise ValueError(
+                "Invalid Discord webhook URL: expected "
+                "https://<discord-host>/api/webhooks/<id>/<token>"
+            ) from None
+
+        hostname = parsed.hostname.lower() if parsed.hostname is not None else ""
+        if parsed.scheme.lower() != "https" or hostname not in _DISCORD_WEBHOOK_HOSTS:
+            raise ValueError(
+                "Invalid Discord webhook URL: expected "
+                "https://<discord-host>/api/webhooks/<id>/<token>"
+            )
+
+        trimmed_path = parsed.path.rstrip("/")
+        segments = trimmed_path.lstrip("/").split("/") if trimmed_path.startswith("/") else []
+        if (
+            len(segments) != 4
+            or segments[0] != "api"
+            or segments[1] != "webhooks"
+            or not segments[2]
+            or not segments[3]
+        ):
+            raise ValueError(
+                "Invalid Discord webhook URL: expected "
+                "https://<discord-host>/api/webhooks/<id>/<token>"
+            )
+        return value
 
     @field_validator("database_url", mode="after")
     @classmethod

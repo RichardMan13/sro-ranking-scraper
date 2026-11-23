@@ -27,10 +27,17 @@ _ensure_accessible_prefect_home()
 from prefect import State, flow, serve  # noqa: E402
 from prefect.deployments.runner import RunnerDeployment  # noqa: E402
 from sqlalchemy import select  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncEngine  # noqa: E402
 
 from src.core.config import Settings, get_settings  # noqa: E402
 from src.core.database import create_engine_from_url, create_session_factory  # noqa: E402
 from src.core.logging import configure_logging, get_logger  # noqa: E402
+from src.core.notifications import (  # noqa: E402
+    POST_FW_SUCCESS_STATUSES,
+    PostFWComparison,
+    load_post_fw_comparison,
+    notify_post_fw_summary,
+)
 from src.flows.tasks import (  # noqa: E402
     ensure_partitions_task,
     purge_old_quarantine_task,
@@ -117,9 +124,36 @@ async def post_fw_flow(server_id: str) -> ScrapeRunSummary:
     """Run an extraordinary post-Fortress War scrape for a single server."""
     settings = get_settings()
     configure_logging(settings.log_level)
+    logger = get_logger("orchestrator")
 
     await ensure_partitions_task()
-    return await scrape_target_task(server_id=server_id, trigger_type="post_fw_extra")
+    summary = await scrape_target_task(server_id=server_id, trigger_type="post_fw_extra")
+
+    if (
+        summary.status in POST_FW_SUCCESS_STATUSES
+        and settings.discord_community_webhook_url is not None
+    ):
+        comparison: PostFWComparison | None = None
+        engine: AsyncEngine | None = None
+        try:
+            engine = create_engine_from_url(str(settings.database_url))
+            session_factory = create_session_factory(engine)
+            async with session_factory() as session:
+                comparison = await load_post_fw_comparison(session, summary)
+        except Exception as exc:
+            logger.warning(
+                "post_fw_comparison_load_failed",
+                server_id=summary.server_id,
+                run_id=str(summary.run_id),
+                error_type=type(exc).__name__,
+            )
+        finally:
+            if engine is not None:
+                await engine.dispose()
+
+        await notify_post_fw_summary(comparison, settings=settings)
+
+    return summary
 
 
 @flow(name="manual-scrape-flow")

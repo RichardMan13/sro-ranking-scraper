@@ -76,6 +76,23 @@ cp .env.example .env
 | `QUARANTINE_RETENTION_DAYS` | Days before old `.html.gz` quarantine files are purged | `30` |
 | `CIRCUIT_BREAKER_COOLDOWN_HOURS` | Cooldown hours after anti-bot challenge | `6` |
 | `ELECTUS_CF_CLEARANCE` | Optional `cf_clearance` cookie for Electus Online | *(empty)* |
+| `DISCORD_OPS_WEBHOOK_URL` | Optional Discord webhook for critical operational failure alerts (`https://discord.com/api/webhooks/<id>/<token>`) | *(empty)* |
+| `DISCORD_COMMUNITY_WEBHOOK_URL` | Optional Discord webhook for automatic post-Fortress War summaries | *(empty)* |
+
+### Discord Notifications (Optional)
+
+Discord webhooks are **optional** and run in best-effort mode (`<= 10s` timeout, `0` retries, `follow_redirects=False`) after database commits and connection disposal so Discord outages never affect scraping or persistence:
+
+- **Silent no-op when empty:** Leaving `DISCORD_OPS_WEBHOOK_URL` and/or `DISCORD_COMMUNITY_WEBHOOK_URL` unset or empty (`""`) disables the respective channel with zero outbound network traffic.
+- **Operational channel (`DISCORD_OPS_WEBHOOK_URL`):** Fires on `SCHEMA_DRIFT`, `LOW_COUNT_QUARANTINE`, `BLOCKED_CHALLENGE`, and `HTTP_ERROR` across `scheduled_12h`, `post_fw_extra`, and `manual` runs. Non-critical statuses (`SUCCESS`, `PARTIAL_SUCCESS`, `TARGET_MAINTENANCE`, `SKIPPED_CIRCUIT_BREAKER`) never trigger alerts.
+- **Community channel (`DISCORD_COMMUNITY_WEBHOOK_URL`):** Fires after successful `post_fw_flow` runs (`SUCCESS` or `PARTIAL_SUCCESS`), summarizing fortress ownership changes (`fortress_held`) and Top 5 official guild deltas against the latest pre-FW baseline within 24 hours.
+- **Testing the ops webhook via `--mode manual`:** Configure `DISCORD_OPS_WEBHOOK_URL` in `.env` and run:
+
+```bash
+python -m src.flows.orchestrator --mode manual --target electus
+```
+
+Healthy runs exit with code `0` without alerting; any run ending in a critical failure status dispatches a PT-BR embed labeled with `trigger_type=manual` without exposing the webhook URL in JSON or stdlib logs.
 
 ---
 

@@ -29,6 +29,7 @@ from src.core.database import (  # noqa: E402
     ensure_monthly_partitions,
 )
 from src.core.logging import get_logger  # noqa: E402
+from src.core.notifications import notify_operational_failure  # noqa: E402
 from src.scrapers import get_scraper  # noqa: E402
 from src.scrapers.base import ScrapeRunSummary  # noqa: E402
 
@@ -68,9 +69,12 @@ async def scrape_target_task(
 
     try:
         async with session_factory() as session:
-            return await scraper.run(session, trigger_type=trigger_type)
+            summary = await scraper.run(session, trigger_type=trigger_type)
     finally:
         await engine.dispose()
+
+    await notify_operational_failure(summary, settings=settings)
+    return summary
 
 
 @task(retries=0, name="purge-old-quarantine")

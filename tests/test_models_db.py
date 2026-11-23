@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import logging
 import selectors
 import socket
 from collections.abc import Coroutine
@@ -17,7 +18,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import Table
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.schema import CreateIndex, CreateTable
@@ -76,6 +77,8 @@ def test_settings_defaults_and_env_overrides(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.delenv("QUARANTINE_RETENTION_DAYS", raising=False)
     monkeypatch.delenv("CIRCUIT_BREAKER_COOLDOWN_HOURS", raising=False)
     monkeypatch.delenv("ELECTUS_CF_CLEARANCE", raising=False)
+    monkeypatch.delenv("DISCORD_OPS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DISCORD_COMMUNITY_WEBHOOK_URL", raising=False)
 
     defaults = Settings(_env_file=None)
     assert str(defaults.database_url) == "postgresql+asyncpg://user:pass@localhost:5432/sro"
@@ -85,6 +88,8 @@ def test_settings_defaults_and_env_overrides(monkeypatch: pytest.MonkeyPatch) ->
     assert defaults.quarantine_retention_days == 30
     assert defaults.circuit_breaker_cooldown_hours == 6
     assert defaults.electus_cf_clearance is None
+    assert defaults.discord_ops_webhook_url is None
+    assert defaults.discord_community_webhook_url is None
 
     monkeypatch.setenv("PREFECT_API_URL", "http://prefect-server:4200/api")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
@@ -170,6 +175,75 @@ def test_settings_normalizes_and_accepts_supported_database_urls(
     assert str(settings.database_url) == expected_url
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("", None),
+        ("   ", None),
+        (SecretStr("   "), None),
+        (
+            "  https://discord.com/api/webhooks/12345/token_abc  ",
+            "https://discord.com/api/webhooks/12345/token_abc",
+        ),
+        (
+            SecretStr("  https://discordapp.com/api/webhooks/12345/token_abc/  "),
+            "https://discordapp.com/api/webhooks/12345/token_abc/",
+        ),
+        (
+            "https://ptb.discord.com/api/webhooks/12345/token_abc",
+            "https://ptb.discord.com/api/webhooks/12345/token_abc",
+        ),
+        (
+            "https://canary.discord.com/api/webhooks/12345/token_abc",
+            "https://canary.discord.com/api/webhooks/12345/token_abc",
+        ),
+    ],
+)
+def test_settings_normalizes_and_accepts_discord_webhook_urls(
+    raw_value: str | SecretStr,
+    expected: str | None,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://user:pass@localhost:5432/sro",
+        discord_ops_webhook_url=raw_value,
+        discord_community_webhook_url=raw_value,
+    )
+    if expected is None:
+        assert settings.discord_ops_webhook_url is None
+        assert settings.discord_community_webhook_url is None
+    else:
+        assert isinstance(settings.discord_ops_webhook_url, SecretStr)
+        assert settings.discord_ops_webhook_url.get_secret_value() == expected
+        assert isinstance(settings.discord_community_webhook_url, SecretStr)
+        assert settings.discord_community_webhook_url.get_secret_value() == expected
+
+
+@pytest.mark.parametrize(
+    "bad_webhook",
+    [
+        "http://discord.com/api/webhooks/12345/secret_token_do_not_leak",
+        "https://:80/api/webhooks/12345/secret_token_do_not_leak",
+        "https://evil.example/api/webhooks/12345/secret_token_do_not_leak",
+        "https://discord.com/api/webhooks/12345",
+        "https://discord.com/api/webhooks/12345/secret_token_do_not_leak/extra",
+        "https://discord.com/api//webhooks/12345/secret_token_do_not_leak",
+        "https://discord.com/v1/webhooks/12345/secret_token_do_not_leak",
+        "not-a-url-secret_token_do_not_leak",
+    ],
+)
+def test_settings_rejects_invalid_discord_webhook_without_leaking_token(
+    bad_webhook: str,
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            _env_file=None,
+            database_url="postgresql+asyncpg://user:pass@localhost:5432/sro",
+            discord_ops_webhook_url=bad_webhook,
+        )
+    assert "secret_token_do_not_leak" not in str(exc_info.value)
+
+
 # ---------------------------------------------------------------------------
 # 2. Structured Logging (`src/core/logging.py`)
 # ---------------------------------------------------------------------------
@@ -215,6 +289,16 @@ def test_logging_level_filtering(capsys: pytest.CaptureFixture[str]) -> None:
     assert payload["event"] == "emitted_warning"
     assert payload["level"] == "warning"
     assert payload["code"] == 503
+
+
+def test_configure_logging_suppresses_httpx_and_httpcore_info_logs() -> None:
+    logging.getLogger("httpx").setLevel(logging.INFO)
+    logging.getLogger("httpcore").setLevel(logging.INFO)
+
+    configure_logging("DEBUG")
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
 
 
 # ---------------------------------------------------------------------------
