@@ -4,7 +4,7 @@
 Prefect 3 orchestration layer for the SRO Ranking Scraper. This package defines atomic Prefect tasks for database partition management, per-server scraping, and quarantine retention cleanup (`tasks.py`), along with scheduled, post-Fortress War, and manual Prefect flows, deployment builders, and the CLI entrypoint (`orchestrator.py`).
 
 ## Interface
-- `[orchestrator.py:VALID_MANUAL_TARGETS]`: Allowed `--target` CLI values (`("all", "chronicle", "electus", "play_golden")`).
+- `[orchestrator.py:VALID_MANUAL_TARGETS]`: Allowed `--target` CLI values (`("all", "chronicle", "electus", "play_golden", "rsilkroad")`).
 - `[orchestrator.py:compute_post_fw_cron]`: Computes a weekly cron expression 30 minutes after a server's `fw_end_time_utc` on `fw_day_of_week` (`0=Sunday .. 6=Saturday`) with day/week rollover.
 - `[orchestrator.py:get_active_servers]`: Asynchronously loads all `Server` rows where `is_active` is `True`, ordered deterministically by `Server.id`.
 - `[orchestrator.py:scheduled_12h_flow]`: Prefect flow (`scheduled-12h-flow`) that ensures monthly partitions, scrapes all active servers with per-server failure isolation (`trigger_type="scheduled_12h"`), and purges expired quarantine files.

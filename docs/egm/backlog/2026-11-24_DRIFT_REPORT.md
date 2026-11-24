@@ -1,5 +1,7 @@
 # EGM Drift Report — Backlog Features (2026-11-24)
 
+> **Status: RESOLVED (Zero Drift — 2026-11-24).** Todos os 11 desvios abaixo (`4/4` em `FEAT-001` e `7/7` em `FEAT-002`, incluindo decisão de escopo e nota de rate limiting `HTTP 429` em runtime) foram corrigidos e validados como **ZERO DRIFT** por auditoria independente `egm-codebase-details`.
+
 ## docs/backlog/feature/FEAT-001_chronicle_full_pagination_and_job_filters.md
 
 - **Teto de segurança não configurável via ambiente (`FEAT-001:L25` vs `src/scrapers/chronicle.py:L31,L261`, `src/core/config.py`, `src/scrapers/__init__.py:L29-L35`):** O escopo prevê paginação completa *"com teto de segurança configurável"*. No código, `max_pages_per_category` existe apenas como parâmetro opcional de `ChronicleScraper.__init__` (padrão `_DEFAULT_MAX_PAGES_SAFETY_CAP = 200`), sem campo correspondente em `Settings` (`src/core/config.py`) e sem repasse em `get_scraper()`, ficando efetivamente fixo em `200` em runtime/CLI.

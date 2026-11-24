@@ -5,7 +5,7 @@ A containerized, HTTP-first data pipeline that extracts public player, guild, an
 ## Architecture Overview
 
 ```text
-[Chronicle / Electus / Play Golden]
+[Chronicle / Electus / Play Golden / RSilkroad]
         │
         ▼ (HTTPX HTTP/2 + Semaphore(3) + lxml / orjson)
 [BaseRankingScraper + Persistent Circuit Breaker]
@@ -23,6 +23,7 @@ A containerized, HTTP-first data pipeline that extracts public player, guild, an
 - **Chronicle SRO** (`chronicle`): `https://play-chronicle.com` (HTML via `lxml`)
 - **Electus Online** (`electus`): `https://electus.online` (JSON API via `orjson`, HTML fallback, optional `ELECTUS_CF_CLEARANCE`)
 - **Play Golden** (`play_golden`): `https://play-golden.online` (HTML via `lxml`)
+- **RSilkroad** (`rsilkroad`): `https://www.rsilkroad.com` (HTML via `lxml`, `pageSize=100`, inter-batch jitter)
 
 ### Core Safeguards
 - **Append-Only Partitioned Storage:** `character_snapshots` and `guild_snapshots` are partitioned by `RANGE (created_at)` with automated monthly partition provisioning (`ensure_monthly_partitions`).
@@ -37,7 +38,7 @@ A containerized, HTTP-first data pipeline that extracts public player, guild, an
 - [src](./src/README.md) — Core Python application package organized into:
   - [src/core](./src/core/README.md) — Pydantic environment settings, async SQLAlchemy engine/session factories, monthly partition DDL provisioning, JSON `structlog` configuration, and best-effort Discord webhook notifications.
   - [src/models](./src/models/README.md) — SQLAlchemy 2.0 PostgreSQL ORM models and Pydantic v2 raw ranking validation/normalization schemas.
-  - [src/scrapers](./src/scrapers/README.md) — HTTP/2 scraper engine (`BaseRankingScraper`), target server parsers (`ChronicleScraper`, `ElectusScraper`, `PlayGoldenScraper`), circuit breaker, integrity guards, gzip quarantine, and bulk persistence.
+  - [src/scrapers](./src/scrapers/README.md) — HTTP/2 scraper engine (`BaseRankingScraper`), target server parsers (`ChronicleScraper`, `ElectusScraper`, `PlayGoldenScraper`, `RSilkroadScraper`), circuit breaker, integrity guards, gzip quarantine, and bulk persistence.
   - [src/flows](./src/flows/README.md) — Prefect 3 tasks, scheduled/post-FW/manual flows, dynamic cron deployment builder, and CLI entrypoint.
   - [src/dashboard](./src/dashboard/README.md) — Isolated read-only Streamlit + Altair analytical dashboard (`psycopg` sync engine, partition-pruned queries, 5 lazy-loaded community views).
 
@@ -51,7 +52,7 @@ A containerized, HTTP-first data pipeline that extracts public player, guild, an
 - **Best-Effort Notification Isolation:** Optional Discord webhooks (`notify_operational_failure`, `notify_post_fw_summary`) run only after async DB engines are disposed, use a 10s timeout with zero retries, never propagate exceptions, and never log webhook URLs or raw exception strings.
 
 ## Global Side Effects
-- **External Network I/O:** Issues async HTTP/2 `GET` requests via `httpx.AsyncClient` to Chronicle SRO, Electus Online, and Play Golden with rotating browser header profiles and optional `cf_clearance` cookies, plus optional best-effort HTTPS `POST` requests to Discord webhooks.
+- **External Network I/O:** Issues async HTTP/2 `GET` requests via `httpx.AsyncClient` to Chronicle SRO, Electus Online, Play Golden, and RSilkroad with rotating browser header profiles and optional `cf_clearance` cookies, plus optional best-effort HTTPS `POST` requests to Discord webhooks.
 - **PostgreSQL 16 Mutations & Queries:** Runs Alembic DDL/DML migrations, provisions `sro_readonly` role/grants via `scripts/provision_readonly_role.sh`, executes `CREATE TABLE IF NOT EXISTS ... PARTITION OF` monthly partition DDL, updates `servers.circuit_breaker_until`, records `scrape_runs` audit rows, bulk-upserts `guilds` and `characters`, bulk-inserts `character_snapshots` and `guild_snapshots` in 1,000-row chunks, and executes read-only analytical `SELECT` queries for the dashboard and post-FW summaries.
 - **Local Filesystem & Process State:** Writes gzipped dead-letter archives to `<quarantine_dir>/<server_id>/<run_id>.html.gz`, recursively unlinks expired `*.html.gz` files in `purge_old_quarantine_task`, configures global `structlog` JSON stdout logging and contextvars, and registers/serves Prefect 3 cron deployments.
 
@@ -79,6 +80,7 @@ cp .env.example .env
 | `QUARANTINE_DIR` | Local dead-letter directory for `.html.gz` artifacts | `./quarantine` (container: `/app/quarantine`) |
 | `QUARANTINE_RETENTION_DAYS` | Days before old `.html.gz` quarantine files are purged | `30` |
 | `CIRCUIT_BREAKER_COOLDOWN_HOURS` | Cooldown hours after anti-bot challenge | `6` |
+| `MAX_PAGES_PER_CATEGORY` | Safety cap on pages fetched per ranking category (`>= 1`) | `400` |
 | `ELECTUS_CF_CLEARANCE` | Optional `cf_clearance` cookie for Electus Online | *(empty)* |
 | `DISCORD_OPS_WEBHOOK_URL` | Optional Discord webhook for critical operational failure alerts (`https://discord.com/api/webhooks/<id>/<token>`) | *(empty)* |
 | `DISCORD_COMMUNITY_WEBHOOK_URL` | Optional Discord webhook for automatic post-Fortress War summaries | *(empty)* |
@@ -118,7 +120,7 @@ docker compose build
 # 2. Start PostgreSQL 16, Prefect 3 server, and scraper-worker
 docker compose up -d postgres prefect-server scraper-worker
 
-# 3. Verify / apply database migrations (001..003)
+# 3. Verify / apply database migrations (001..004)
 docker compose exec scraper-worker alembic upgrade head
 
 # 4. Provision the dedicated read-only PostgreSQL role (`sro_readonly`)
@@ -188,11 +190,12 @@ alembic upgrade head
 ## Orchestration, CLI & Prefect UI
 
 ### 1. Scheduled Mode (`--mode serve`)
-The `scraper-worker` image defaults to `python -m src.flows.orchestrator --mode serve` (`Dockerfile`), while `docker-compose.yml` overrides the service command to `sh -c "alembic upgrade head && exec python -m src.flows.orchestrator --mode serve"`. At startup, it queries active rows in `servers` and registers four Prefect 3 deployments:
+The `scraper-worker` image defaults to `python -m src.flows.orchestrator --mode serve` (`Dockerfile`), while `docker-compose.yml` overrides the service command to `sh -c "alembic upgrade head && exec python -m src.flows.orchestrator --mode serve"`. At startup, it queries active rows in `servers` and registers five Prefect 3 deployments:
 - `scheduled-12h` (`cron="0 0,12 * * *"`) — runs `ensure_partitions_task`, scrapes every active server in isolation (`return_state=True`), and runs `purge_old_quarantine_task`.
 - `post-fw-chronicle` (`cron="30 22 * * 0"`) — runs 30 minutes after Chronicle Fortress War (Sunday 22:00 UTC).
 - `post-fw-electus` (`cron="30 21 * * 0"`) — runs 30 minutes after Electus Fortress War (Sunday 21:00 UTC).
 - `post-fw-play_golden` (`cron="30 20 * * 6"`) — runs 30 minutes after Play Golden Fortress War (Saturday 20:00 UTC).
+- `post-fw-rsilkroad` (`cron="30 20 * * 0"`) — runs 30 minutes after RSilkroad Fortress War (Sunday 20:00 UTC).
 
 To launch the deployment runner manually:
 
@@ -201,7 +204,7 @@ python -m src.flows.orchestrator --mode serve
 ```
 
 ### 2. Manual Scrape Mode (`--mode manual`)
-Trigger an immediate extraction run for a single server (`chronicle`, `electus`, `play_golden`) or `all` active servers with `trigger_type='manual'`:
+Trigger an immediate extraction run for a single server (`chronicle`, `electus`, `play_golden`, `rsilkroad`) or `all` active servers with `trigger_type='manual'`:
 
 ```bash
 # Inside Docker Compose
@@ -213,7 +216,7 @@ python -m src.flows.orchestrator --mode manual --target all
 
 ### 3. Verifying in the Prefect 3 UI
 Open `http://localhost:4200` in a browser to verify:
-- **Deployments:** Confirm `scheduled-12h`, `post-fw-chronicle`, `post-fw-electus`, and `post-fw-play_golden` appear as `Ready`.
+- **Deployments:** Confirm `scheduled-12h`, `post-fw-chronicle`, `post-fw-electus`, `post-fw-play_golden`, and `post-fw-rsilkroad` appear as `Ready`.
 - **Flow Runs:** Inspect completed/failed task states (`ensure-partitions`, `scrape-target`, `purge-old-quarantine`) and trigger ad-hoc runs.
 
 ---

@@ -9,10 +9,10 @@
 ## Objetivo
 Extrair **todas as páginas** dos rankings de `https://www.rsilkroad.com/Rank/Player` e `https://www.rsilkroad.com/Rank/Guild`.
 
-> **Nota de Escopo (`BACKLOG.md`):** Por envolver um novo servidor alvo (`src/scrapers/rsilkroad.py`, registro em `src/scrapers/__init__.py` e seed na tabela `servers` via Alembic), avaliar se permanece como item incremental ou se deve ser promovido para `Moved to Design` antes da implementação.
+> **Decisão de Escopo (`BACKLOG.md`):** Mantido como item incremental (`Done`) por reaproveitar integralmente o contrato `BaseRankingScraper` sem alterações de arquitetura ou novas tabelas, com a inclusão do alvo refletida em [001_sro_ranking_scraper_pipeline.md](../../designs/001_sro_ranking_scraper_pipeline.md).
 
 ## Achados da Investigação
-- **Status HTTP & Proteção:** HTTP `200` limpo em `/Rank/Player` e `/Rank/Guild` (ASP.NET MVC + PagedList atrás de Cloudflare, sem challenge anti-bot).
+- **Status HTTP & Proteção:** Sondas pontuais retornaram HTTP `200` limpo em `/Rank/Player` e `/Rank/Guild` (ASP.NET MVC + PagedList atrás de Cloudflare, sem challenge JS). Em execução real com paginação em rajada (`2026-11-24 12:04:53 UTC`), o Cloudflare aplicou rate limiting com `HTTP 429` (`BLOCKED_CHALLENGE`, acionando quarentena, alerta no Discord e circuit breaker de 6h), motivando a inclusão de pausa com jitter entre lotes (`DEFAULT_INTER_BATCH_DELAY_RANGE = (0.35, 0.75)`).
 - **Otimização de paginação (`pageSize=100`):**
   - Com `pageSize=25` (padrão), `/Rank/Player` tem **277 páginas** (~6.925 players).
   - O servidor aceita `pageSize=100` (`/Rank/Player?page={page}&pageSize=100`), reduzindo para **70 páginas** (4× menos requisições, viável dentro do budget de 180s com `Semaphore(3)`).

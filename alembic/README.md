@@ -11,7 +11,7 @@ Configures and executes Alembic schema and analytical-view migrations for Postgr
 - `[env.py:run_async_migrations]` — Async runner that resolves the database URL, constructs an async engine via `async_engine_from_config` with `pool.NullPool`, executes `do_run_migrations` via `connection.run_sync`, and disposes the engine.
 - `[env.py:run_migrations_online]` — Synchronous entrypoint executing `run_async_migrations()` via `asyncio.run`.
 - Subdirectories:
-  - [versions](./versions/README.md) — Linear PostgreSQL 16 migration chain (`001_initial_schema` -> `002_analytical_views` -> `003_dashboard_indexes`) creating tables, seeds, monthly range partitions, indexes, and analytical SQL views.
+  - [versions](./versions/README.md) — Linear PostgreSQL 16 migration chain (`001_initial_schema` -> `002_analytical_views` -> `003_dashboard_indexes` -> `004_seed_rsilkroad`) creating tables, seeds, monthly range partitions, indexes, and analytical SQL views.
 
 ## Invariants
 - `[env.py:_normalize_async_url]` — Strips whitespace, lowercases the URL scheme, and rewrites `postgres://` and `postgresql://` prefixes to `postgresql+asyncpg://`.

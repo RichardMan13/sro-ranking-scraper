@@ -1,5 +1,7 @@
 # EGM Bootstrap Drift Report (2026-11-24)
 
+> **Status: RESOLVED (Zero Drift — 2026-11-24).** Todos os 6 desvios originais abaixo e os desvios subsequentes introduzidos por `FEAT-001` e `FEAT-002` (`README.md`, `alembic/README.md`, `alembic/versions/README.md`, `src/README.md`, `src/core/README.md`, `src/flows/README.md`, `src/scrapers/README.md`) foram corrigidos e validados como **ZERO DRIFT (12/12 arquivos limpos)** por auditoria independente `egm-codebase-details`.
+
 ## alembic/versions/README.md
 
 No drift detected.
