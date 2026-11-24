@@ -107,7 +107,18 @@ Por que esta pequena melhoria é necessária?
 
 | ID | Arquivo | Componente | Prioridade | Status | Resumo |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| — | *Nenhuma melhoria pendente registrada* | — | — | — | — |
+| FEAT-003 | [FEAT-003_rsilkroad_throttling_and_cf_clearance_settings.md](feature/FEAT-003_rsilkroad_throttling_and_cf_clearance_settings.md) | scraper | Média | Pending | Expor `page_size`, `inter_batch_delay` e `RSILKROAD_CF_CLEARANCE` do `RSilkroadScraper` via `Settings`/`.env` para mitigação de `HTTP 429` sem rebuild |
+
+---
+
+## Intenções para Novos Designs (`docs/designs/`)
+
+> Itens de escopo estrutural/arquitetural que **não** pertencem a `docs/backlog/feature/` e serão detalhados diretamente via fluxo EGM em `docs/designs/`.
+
+| Tema | Componente | Origem / Referência | Status | Resumo |
+| :--- | :--- | :--- | :--- | :--- |
+| Multi-stage Docker Build (`worker` vs `dashboard`) | infra | [003_analytical_dashboard.md](../designs/003_analytical_dashboard.md) | Planned for Design | Separar targets no `Dockerfile` para remover `streamlit`/`altair` do `scraper-worker` (teto de 512MB) e `prefect`/`lxml`/`gcc` do `dashboard` |
+| Expansão de Cobertura de Dados | scraper / db | [001_sro_ranking_scraper_pipeline.md](../designs/001_sro_ranking_scraper_pipeline.md) | Planned for Design | Escopo ainda a definir (novos servidores, renames heurísticos e/ou novas métricas/entidades) |
 
 ---
 
