@@ -135,22 +135,22 @@ def test_chronicle_parsers_extract_all_categories_and_stop_early(tmp_path: Path)
 
     async def execute() -> tuple[CategoryFetchResult, CategoryFetchResult, CategoryFetchResult]:
         with respx.mock(assert_all_called=True) as mock_router:
-            mock_router.get(f"{base_url}/ranking/player?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
                 return_value=httpx.Response(200, content=player_html)
             )
-            mock_router.get(f"{base_url}/ranking/player?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
-            mock_router.get(f"{base_url}/ranking/job?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
                 return_value=httpx.Response(200, content=job_html)
             )
-            mock_router.get(f"{base_url}/ranking/job?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-job-2.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
-            mock_router.get(f"{base_url}/ranking/guild?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-guild-1.html").mock(
                 return_value=httpx.Response(200, content=guild_html)
             )
-            mock_router.get(f"{base_url}/ranking/guild?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-guild-2.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
             async with httpx.AsyncClient(http2=True) as client:
@@ -170,8 +170,6 @@ def test_chronicle_parsers_extract_all_categories_and_stop_early(tmp_path: Path)
     assert p1.race == "CH"
     assert p1.guild_name == "ApexLegion"
     assert p1.item_points == 1501.5
-    assert p1.extra_metrics["pvp_kd"] == "11/2"
-    assert p1.extra_metrics["unique_points"] == 2015
 
     # Rank 4 has '-' guild placeholder and alt="European" race fallback
     p4 = RawPlayerRankingItem.model_validate(player_res.raw_records[3])
@@ -183,20 +181,24 @@ def test_chronicle_parsers_extract_all_categories_and_stop_early(tmp_path: Path)
     p3 = RawPlayerRankingItem.model_validate(player_res.raw_records[2])
     assert p3.item_points == 1503.5
 
-    # Job parsing preserves UTF-8 Portuguese job names (LADRÃO / CAÇADOR)
+    # Job parsing extracts Job K/D Ratio and Job Points with optional job_type/job_level
     assert len(job_res.raw_records) == 10
     jobs = [RawJobRankingItem.model_validate(rec) for rec in job_res.raw_records]
-    assert jobs[3].job_type == "TRADER"
-    assert jobs[4].job_type == "THIEF"
-    assert jobs[5].job_type == "HUNTER"
+    assert jobs[0].char_name == "Chron_Hero_001"
+    assert jobs[0].job_type is None
+    assert jobs[0].job_level is None
+    assert jobs[0].job_points == 9800
+    assert jobs[0].extra_metrics["job_kd_ratio"] == "12/2"
 
-    # Guild parsing pre-splits "45/50", "1,234/2,000", "-/50"
+    # Guild parsing pre-splits "45/50", "1,234/2,000", "-/50" and captures guild_level
     assert len(guild_res.raw_records) == 6
     assert guild_res.raw_records[0]["members_count"] == "45"
     assert guild_res.raw_records[1]["members_count"] == "1,234"
     assert guild_res.raw_records[2]["members_count"] == "-"
     guilds = [RawGuildRankingItem.model_validate(rec) for rec in guild_res.raw_records]
     assert guilds[0].members_count == 45
+    assert guilds[0].master_name is None
+    assert guilds[0].extra_metrics["guild_level"] == 5
     assert guilds[1].members_count == 1234
     assert guilds[1].total_item_points == 118200.25
     assert guilds[2].members_count is None
@@ -210,56 +212,55 @@ def test_chronicle_handles_missing_tbody_empty_200_and_multipage_dedup(tmp_path:
 
     no_tbody_page1 = b"""
     <html><body>
-      <table class="ranking-table">
+      <table class="table table-striped table-hover">
         <tr>
-          <th>Rank</th><th>Char</th><th>Guild</th><th>Lvl</th>
-          <th>IP</th><th>Honor</th><th>Title</th>
+          <th>#</th><th>Character</th><th>Guild</th><th>Level</th><th>ItemPoints</th>
         </tr>
         <tr>
           <td>1</td><td><img data-race="CH"><a class="char-link">Alpha</a></td>
-          <td>G1</td><td>110</td><td>100.0</td><td>50</td><td>General</td>
+          <td>G1</td><td>110</td><td>100.0</td>
         </tr>
         <tr>
           <td>2</td><td><img alt="European"><a class="char-link">Bravo</a></td>
-          <td>G2</td><td>109</td><td>90.0</td><td>40</td><td>-</td>
+          <td>G2</td><td>109</td><td>90.0</td>
         </tr>
       </table>
     </body></html>
     """
     no_tbody_page2 = b"""
     <html><body>
-      <table class="ranking-table">
+      <table class="table table-striped table-hover">
         <tr>
           <td>3</td><td><img data-race="EU"><a class="char-link">Bravo</a></td>
-          <td>G2</td><td>109</td><td>89.0</td><td>39</td><td>-</td>
+          <td>G2</td><td>109</td><td>89.0</td>
         </tr>
         <tr>
           <td>4</td><td><img data-race="CH"><a class="char-link">Charlie</a></td>
-          <td>G1</td><td>108</td><td>80.0</td><td>30</td><td>-</td>
+          <td>G1</td><td>108</td><td>80.0</td>
         </tr>
       </table>
     </body></html>
     """
     colspan_empty_page = b"""
     <html><body>
-      <table class="ranking-table">
-        <tbody><tr><td colspan="7">No records found</td></tr></tbody>
+      <table class="table table-striped table-hover">
+        <tbody><tr><td colspan="5">No records found</td></tr></tbody>
       </table>
     </body></html>
     """
 
     async def execute() -> tuple[CategoryFetchResult, CategoryFetchResult]:
         with respx.mock(assert_all_called=True) as mock_router:
-            mock_router.get(f"{base_url}/ranking/player?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
                 return_value=httpx.Response(200, content=no_tbody_page1)
             )
-            mock_router.get(f"{base_url}/ranking/player?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
                 return_value=httpx.Response(200, content=no_tbody_page2)
             )
-            mock_router.get(f"{base_url}/ranking/player?page=3").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-3.html").mock(
                 return_value=httpx.Response(200, content=colspan_empty_page)
             )
-            mock_router.get(f"{base_url}/ranking/job?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
                 return_value=httpx.Response(200, content=b"")
             )
             async with httpx.AsyncClient(http2=True) as client:
@@ -753,32 +754,32 @@ def test_end_to_end_run_success_and_job_reconciliation(
     async def execute() -> ScrapeRunSummary:
         with respx.mock(assert_all_called=True) as mock_router:
             if server_id == "chronicle":
-                mock_router.get(f"{base_url}/ranking/player?page=1").mock(
+                mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
                     return_value=httpx.Response(
                         200, content=_load_fixture_bytes("chronicle_player.html")
                     )
                 )
-                mock_router.get(f"{base_url}/ranking/player?page=2").mock(
+                mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
                     return_value=httpx.Response(
                         200, content=_load_fixture_bytes("chronicle_empty_page.html")
                     )
                 )
-                mock_router.get(f"{base_url}/ranking/job?page=1").mock(
+                mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
                     return_value=httpx.Response(
                         200, content=_load_fixture_bytes("chronicle_job.html")
                     )
                 )
-                mock_router.get(f"{base_url}/ranking/job?page=2").mock(
+                mock_router.get(f"{base_url}/ranking/top-job-2.html").mock(
                     return_value=httpx.Response(
                         200, content=_load_fixture_bytes("chronicle_empty_page.html")
                     )
                 )
-                mock_router.get(f"{base_url}/ranking/guild?page=1").mock(
+                mock_router.get(f"{base_url}/ranking/top-guild-1.html").mock(
                     return_value=httpx.Response(
                         200, content=_load_fixture_bytes("chronicle_guild.html")
                     )
                 )
-                mock_router.get(f"{base_url}/ranking/guild?page=2").mock(
+                mock_router.get(f"{base_url}/ranking/top-guild-2.html").mock(
                     return_value=httpx.Response(
                         200, content=_load_fixture_bytes("chronicle_empty_page.html")
                     )
@@ -864,8 +865,12 @@ def test_end_to_end_run_success_and_job_reconciliation(
     assert len(matching_snaps) == 1
     snap = matching_snaps[0]
     assert snap["guild_id"] == expected_guild_id
-    assert snap["job_type"] is not None
-    assert snap["job_level"] is not None
+    if server_id == "chronicle":
+        assert snap["job_points"] == 6300
+        assert snap["extra_metrics"]["job_kd_ratio"] == "6/2"
+    else:
+        assert snap["job_type"] is not None
+        assert snap["job_level"] is not None
     assert snap["extra_metrics"]["job_rank"] >= 1
     assert isinstance(snap["item_points"], Decimal)
 
@@ -879,30 +884,30 @@ def test_chronicle_partial_success_le5_percent(tmp_path: Path) -> None:
 
     async def execute() -> ScrapeRunSummary:
         with respx.mock(assert_all_called=True) as mock_router:
-            mock_router.get(f"{base_url}/ranking/player?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
                 return_value=httpx.Response(
                     200, content=_load_fixture_bytes("chronicle_player_partial_le5.html")
                 )
             )
-            mock_router.get(f"{base_url}/ranking/player?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
                 return_value=httpx.Response(
                     200, content=_load_fixture_bytes("chronicle_empty_page.html")
                 )
             )
-            mock_router.get(f"{base_url}/ranking/job?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
                 return_value=httpx.Response(200, content=_load_fixture_bytes("chronicle_job.html"))
             )
-            mock_router.get(f"{base_url}/ranking/job?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-job-2.html").mock(
                 return_value=httpx.Response(
                     200, content=_load_fixture_bytes("chronicle_empty_page.html")
                 )
             )
-            mock_router.get(f"{base_url}/ranking/guild?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-guild-1.html").mock(
                 return_value=httpx.Response(
                     200, content=_load_fixture_bytes("chronicle_guild.html")
                 )
             )
-            mock_router.get(f"{base_url}/ranking/guild?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-guild-2.html").mock(
                 return_value=httpx.Response(
                     200, content=_load_fixture_bytes("chronicle_empty_page.html")
                 )
@@ -980,21 +985,21 @@ def test_chronicle_integrity_guards_and_quarantine(
 
     async def execute() -> ScrapeRunSummary:
         with respx.mock(assert_all_called=True) as mock_router:
-            mock_router.get(f"{base_url}/ranking/player?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
                 return_value=httpx.Response(200, content=player_bytes)
             )
             if player_fixture != "chronicle_schema_drift_layout.html":
-                mock_router.get(f"{base_url}/ranking/player?page=2").mock(
+                mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
                     return_value=httpx.Response(200, content=empty_bytes)
                 )
-            mock_router.get(f"{base_url}/ranking/job?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
                 return_value=httpx.Response(200, content=empty_bytes)
             )
-            mock_router.get(f"{base_url}/ranking/guild?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-guild-1.html").mock(
                 return_value=httpx.Response(200, content=guild_bytes)
             )
             if guild_fixture != "chronicle_empty_page.html":
-                mock_router.get(f"{base_url}/ranking/guild?page=2").mock(
+                mock_router.get(f"{base_url}/ranking/top-guild-2.html").mock(
                     return_value=httpx.Response(200, content=empty_bytes)
                 )
             return await scraper.run(cast(AsyncSession, session), trigger_type="manual")
@@ -1022,11 +1027,11 @@ def test_chronicle_and_golden_data_attributes_and_edge_cases(tmp_path: Path) -> 
 
     chronicle_attr_html = b"""
     <html><body>
-      <table class="ranking-table"><tbody>
-        <tr data-pvp-kd="18/2" data-unique-points="4,250">
+      <table class="table table-striped table-hover"><tbody>
+        <tr>
           <td>#1</td>
           <td><img src="/img/ch.png"><a href="/c/1">AttrHero</a></td>
-          <td>AttrGuild</td><td>110</td><td>2500.0</td><td>1200</td><td>General</td>
+          <td>AttrGuild</td><td>110</td><td>2500.0</td>
         </tr>
       </tbody></table>
     </body></html>
@@ -1052,10 +1057,10 @@ def test_chronicle_and_golden_data_attributes_and_edge_cases(tmp_path: Path) -> 
 
     async def execute() -> tuple[CategoryFetchResult, CategoryFetchResult, CategoryFetchResult]:
         with respx.mock(assert_all_called=True) as mock_router:
-            mock_router.get("https://play-chronicle.com/ranking/player?page=1").mock(
+            mock_router.get("https://play-chronicle.com/ranking/top-player-1.html").mock(
                 return_value=httpx.Response(200, content=chronicle_attr_html)
             )
-            mock_router.get("https://play-chronicle.com/ranking/player?page=2").mock(
+            mock_router.get("https://play-chronicle.com/ranking/top-player-2.html").mock(
                 return_value=httpx.Response(200, content=b"")
             )
             mock_router.get("https://play-golden.online/ranking/characters?page=1").mock(
@@ -1080,7 +1085,7 @@ def test_chronicle_and_golden_data_attributes_and_edge_cases(tmp_path: Path) -> 
 
     c_item = RawPlayerRankingItem.model_validate(c_res.raw_records[0])
     assert c_item.race == "CH"
-    assert c_item.extra_metrics == {"pvp_kd": "18/2", "unique_points": 4250}
+    assert c_item.item_points == 2500.0
 
     g_p_item = RawPlayerRankingItem.model_validate(g_p_res.raw_records[0])
     assert g_p_item.race == "CH"
@@ -1208,7 +1213,7 @@ def test_invalid_utf8_bytes_do_not_crash_run(tmp_path: Path, server_id: str) -> 
             for i in range(2, 11)
         ]
         player_html = (
-            b'<html><body><table class="ranking-table"><tbody>'
+            b'<html><body><table class="table table-striped table-hover"><tbody>'
             + b"".join(rows)
             + b"</tbody></table></body></html>"
         )
@@ -1246,23 +1251,23 @@ def test_invalid_utf8_bytes_do_not_crash_run(tmp_path: Path, server_id: str) -> 
     async def execute() -> ScrapeRunSummary:
         with respx.mock(assert_all_called=True) as mock_router:
             if server_id == "chronicle":
-                mock_router.get(f"{base_url}/ranking/player?page=1").mock(
+                mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
                     return_value=httpx.Response(
                         200,
                         headers={"Content-Type": "text/html; charset=utf-8"},
                         content=player_html,
                     )
                 )
-                mock_router.get(f"{base_url}/ranking/player?page=2").mock(
+                mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
                     return_value=httpx.Response(200, content=empty_html)
                 )
-                mock_router.get(f"{base_url}/ranking/job?page=1").mock(
+                mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
                     return_value=httpx.Response(200, content=empty_html)
                 )
-                mock_router.get(f"{base_url}/ranking/guild?page=1").mock(
+                mock_router.get(f"{base_url}/ranking/top-guild-1.html").mock(
                     return_value=httpx.Response(200, content=guild_bytes)
                 )
-                mock_router.get(f"{base_url}/ranking/guild?page=2").mock(
+                mock_router.get(f"{base_url}/ranking/top-guild-2.html").mock(
                     return_value=httpx.Response(200, content=empty_html)
                 )
             elif server_id == "play_golden":
@@ -1342,10 +1347,10 @@ def test_unicode_isdigit_superscript_does_not_crash_chronicle_or_golden(tmp_path
     chronicle = ChronicleScraper(settings, retry_delays=(0.0, 0.0))
     golden = PlayGoldenScraper(settings, retry_delays=(0.0, 0.0))
 
-    chronicle_html = (
-        b'<html><body><table class="ranking-table"><tbody>'
-        + _build_chronicle_player_row_bytes(1, b"HeroOne", unique_points="\u00b2")
-        + b"</tbody></table></body></html>"
+    chronicle_guild_html = (
+        b'<html><body><table class="table table-striped table-hover"><tbody>'
+        b"<tr><td>1</td><td><a>GuildOne</a></td><td>\xc2\xb2</td><td>25</td><td>15000</td></tr>"
+        b"</tbody></table></body></html>"
     )
     golden_html = (
         b'<html><body><table class="table-ranking"><tbody>'
@@ -1355,10 +1360,10 @@ def test_unicode_isdigit_superscript_does_not_crash_chronicle_or_golden(tmp_path
 
     async def execute() -> tuple[CategoryFetchResult, CategoryFetchResult]:
         with respx.mock(assert_all_called=True) as mock_router:
-            mock_router.get("https://play-chronicle.com/ranking/player?page=1").mock(
-                return_value=httpx.Response(200, content=chronicle_html)
+            mock_router.get("https://play-chronicle.com/ranking/top-guild-1.html").mock(
+                return_value=httpx.Response(200, content=chronicle_guild_html)
             )
-            mock_router.get("https://play-chronicle.com/ranking/player?page=2").mock(
+            mock_router.get("https://play-chronicle.com/ranking/top-guild-2.html").mock(
                 return_value=httpx.Response(200, content=b"")
             )
             mock_router.get("https://play-golden.online/ranking/characters?page=1").mock(
@@ -1368,22 +1373,22 @@ def test_unicode_isdigit_superscript_does_not_crash_chronicle_or_golden(tmp_path
                 return_value=httpx.Response(200, content=b"")
             )
             async with httpx.AsyncClient(http2=True) as client:
-                c_res = await chronicle.fetch_player_pages(client, "https://play-chronicle.com")
+                c_res = await chronicle.fetch_guild_pages(client, "https://play-chronicle.com")
                 g_res = await golden.fetch_player_pages(client, "https://play-golden.online")
                 return c_res, g_res
 
     c_res, g_res = _run_async(execute())
 
-    c_item = RawPlayerRankingItem.model_validate(c_res.raw_records[0])
+    c_item = RawGuildRankingItem.model_validate(c_res.raw_records[0])
     g_item = RawPlayerRankingItem.model_validate(g_res.raw_records[0])
-    assert c_item.extra_metrics["unique_points"] == "\u00b2"
+    assert c_item.extra_metrics["guild_level"] == "\u00b2"
     assert g_item.extra_metrics["gold"] == "\u00b2"
 
 
-@pytest.mark.parametrize("raw_unique_points", ["NaN", "inf", "-Infinity"])
+@pytest.mark.parametrize("raw_guild_level", ["NaN", "inf", "-Infinity"])
 def test_chronicle_non_finite_floats_remain_json_compliant(
     tmp_path: Path,
-    raw_unique_points: str,
+    raw_guild_level: str,
 ) -> None:
     settings = _make_settings(tmp_path)
     scraper = ChronicleScraper(settings, retry_delays=(0.0, 0.0))
@@ -1391,33 +1396,44 @@ def test_chronicle_non_finite_floats_remain_json_compliant(
     server = _make_target_server("chronicle", base_url, min_records_expected=5)
     session = FakeAsyncSession(server)
 
-    rows = [_build_chronicle_player_row_bytes(1, b"HeroFloat", unique_points=raw_unique_points)] + [
-        _build_chronicle_player_row_bytes(i, f"Hero_{i:02d}".encode(), unique_points="250")
-        for i in range(2, 6)
+    player_rows = [
+        _build_chronicle_player_row_bytes(i, f"Hero_{i:02d}".encode()) for i in range(1, 6)
     ]
     player_html = (
-        b'<html><body><table class="ranking-table"><tbody>'
-        + b"".join(rows)
+        b'<html><body><table class="table table-striped table-hover"><tbody>'
+        + b"".join(player_rows)
         + b"</tbody></table></body></html>"
     )
-    guild_bytes = _load_fixture_bytes("chronicle_guild.html")
+    guild_rows = [
+        (
+            f"<tr><td>{i}</td><td><a>Guild_{i}</a></td>"
+            f"<td>{raw_guild_level if i == 1 else '5'}</td>"
+            f"<td>20</td><td>10000</td></tr>"
+        ).encode()
+        for i in range(1, 6)
+    ]
+    guild_html = (
+        b'<html><body><table class="table table-striped table-hover"><tbody>'
+        + b"".join(guild_rows)
+        + b"</tbody></table></body></html>"
+    )
     empty_html = _load_fixture_bytes("chronicle_empty_page.html")
 
     async def execute() -> ScrapeRunSummary:
         with respx.mock(assert_all_called=True) as mock_router:
-            mock_router.get(f"{base_url}/ranking/player?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
                 return_value=httpx.Response(200, content=player_html)
             )
-            mock_router.get(f"{base_url}/ranking/player?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
-            mock_router.get(f"{base_url}/ranking/job?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
-            mock_router.get(f"{base_url}/ranking/guild?page=1").mock(
-                return_value=httpx.Response(200, content=guild_bytes)
+            mock_router.get(f"{base_url}/ranking/top-guild-1.html").mock(
+                return_value=httpx.Response(200, content=guild_html)
             )
-            mock_router.get(f"{base_url}/ranking/guild?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-guild-2.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
             return await scraper.run(cast(AsyncSession, session), trigger_type="manual")
@@ -1425,11 +1441,11 @@ def test_chronicle_non_finite_floats_remain_json_compliant(
     summary = _run_async(execute())
 
     assert summary.status == "SUCCESS"
-    first_extras = session.char_snapshot_chunks[0][0]["extra_metrics"]
-    assert first_extras["unique_points"] == raw_unique_points
-    assert isinstance(first_extras["unique_points"], str)
+    first_extras = session.guild_snapshot_chunks[0][0]["extra_metrics"]
+    assert first_extras["guild_level"] == raw_guild_level
+    assert isinstance(first_extras["guild_level"], str)
     serialized = json.dumps(first_extras, allow_nan=False)
-    assert raw_unique_points in serialized
+    assert raw_guild_level in serialized
 
 
 @pytest.mark.parametrize(
@@ -1454,18 +1470,21 @@ def test_empty_notice_with_digits_stops_pagination_at_page_2(
     if server_id == "chronicle":
         base_url = "https://play-chronicle.com"
         page1_html = (
-            b'<html><body><table class="ranking-table"><tbody>'
+            b'<html><body><table class="table table-striped table-hover"><tbody>'
             + b"".join(
                 _build_chronicle_player_row_bytes(i, f"Char_{i}".encode()) for i in range(1, 4)
             )
             + b"</tbody></table></body></html>"
         )
         page2_html = (
-            b'<html><body><table class="ranking-table"><tbody>'
-            + f'<tr><td colspan="7">{notice_text}</td></tr>'.encode()
+            b'<html><body><table class="table table-striped table-hover"><tbody>'
+            + f'<tr><td colspan="5">{notice_text}</td></tr>'.encode()
             + b"</tbody></table></body></html>"
         )
-        player_path = "/ranking/player"
+        expected_html_urls = [
+            f"{base_url}/ranking/top-player-1.html",
+            f"{base_url}/ranking/top-player-2.html",
+        ]
     elif server_id == "play_golden":
         base_url = "https://play-golden.online"
         page1_html = (
@@ -1478,7 +1497,10 @@ def test_empty_notice_with_digits_stops_pagination_at_page_2(
             + f'<tr><td colspan="9">{notice_text}</td></tr>'.encode()
             + b"</tbody></table></body></html>"
         )
-        player_path = "/ranking/characters"
+        expected_html_urls = [
+            f"{base_url}/ranking/characters?page=1",
+            f"{base_url}/ranking/characters?page=2",
+        ]
     else:
         base_url = "https://electus.online"
         page1_html = (
@@ -1493,7 +1515,10 @@ def test_empty_notice_with_digits_stops_pagination_at_page_2(
             + f'<tr><td colspan="7">{notice_text}</td></tr>'.encode()
             + b"</tbody></table></body></html>"
         )
-        player_path = "/ranking/player"
+        expected_html_urls = [
+            f"{base_url}/ranking/player?page=1",
+            f"{base_url}/ranking/player?page=2",
+        ]
 
     requested_urls: list[str] = []
 
@@ -1502,9 +1527,9 @@ def test_empty_notice_with_digits_stops_pagination_at_page_2(
         requested_urls.append(url)
         if "/api/ranking/player" in url:
             return httpx.Response(404, text="Not Found")
-        if "page=1" in url:
+        if url == expected_html_urls[0]:
             return httpx.Response(200, content=page1_html)
-        if "page=2" in url:
+        if url == expected_html_urls[1]:
             return httpx.Response(200, content=page2_html)
         return httpx.Response(200, content=b"")
 
@@ -1516,11 +1541,8 @@ def test_empty_notice_with_digits_stops_pagination_at_page_2(
     res = _run_async(execute())
 
     assert len(res.raw_records) == 3
-    html_requests = [u for u in requested_urls if "/api/" not in u and player_path in u]
-    assert html_requests == [
-        f"{base_url}{player_path}?page=1",
-        f"{base_url}{player_path}?page=2",
-    ]
+    html_requests = [u for u in requested_urls if "/api/" not in u]
+    assert html_requests == expected_html_urls
     if server_id == "electus":
         assert requested_urls == [
             f"{base_url}/api/ranking/player?page=1&limit=100",
@@ -1537,25 +1559,25 @@ def test_single_cell_numeric_malformed_row_preserved_for_schema_drift(tmp_path: 
     session = FakeAsyncSession(server)
 
     malformed_html = (
-        b'<html><body><table class="ranking-table"><tbody>'
+        b'<html><body><table class="table table-striped table-hover"><tbody>'
         b"<tr><td>1</td></tr>"
-        b'<tr><td colspan="7">1</td></tr>'
+        b'<tr><td colspan="5">1</td></tr>'
         b"</tbody></table></body></html>"
     )
     empty_html = _load_fixture_bytes("chronicle_empty_page.html")
 
     async def execute() -> ScrapeRunSummary:
         with respx.mock(assert_all_called=True) as mock_router:
-            mock_router.get(f"{base_url}/ranking/player?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
                 return_value=httpx.Response(200, content=malformed_html)
             )
-            mock_router.get(f"{base_url}/ranking/player?page=2").mock(
+            mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
-            mock_router.get(f"{base_url}/ranking/job?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
-            mock_router.get(f"{base_url}/ranking/guild?page=1").mock(
+            mock_router.get(f"{base_url}/ranking/top-guild-1.html").mock(
                 return_value=httpx.Response(200, content=empty_html)
             )
             return await scraper.run(cast(AsyncSession, session), trigger_type="manual")
@@ -1565,3 +1587,180 @@ def test_single_cell_numeric_malformed_row_preserved_for_schema_drift(tmp_path: 
     assert summary.status == "SCHEMA_DRIFT"
     assert summary.validation_errors_count == 2
     assert summary.records_persisted == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. Backlog Regression Tests (FIX-001, FIX-002, FIX-003)
+# ---------------------------------------------------------------------------
+
+
+def test_fix001_electus_hyperfilter_http200_triggers_blocked_challenge_and_cb(
+    tmp_path: Path,
+) -> None:
+    settings = _make_electus_settings(tmp_path)
+    scraper = ElectusScraper(settings, retry_delays=(0.0, 0.0))
+    base_url = "https://electus.online"
+    server = _make_target_server("electus", base_url, min_records_expected=100)
+    session = FakeAsyncSession(server)
+    hyperfilter_html = _load_fixture_bytes("electus_hyperfilter_200.html")
+
+    async def execute() -> ScrapeRunSummary:
+        with respx.mock(assert_all_called=True) as mock_router:
+            mock_router.get(f"{base_url}/api/ranking/player?page=1&limit=100").mock(
+                return_value=httpx.Response(200, content=hyperfilter_html)
+            )
+            return await scraper.run(cast(AsyncSession, session), trigger_type="scheduled_12h")
+
+    before = datetime.now(UTC)
+    summary = _run_async(execute())
+
+    assert summary.status == "BLOCKED_CHALLENGE"
+    assert summary.http_status_code == 200
+    assert summary.records_persisted == 0
+    assert summary.circuit_breaker_until is not None
+    assert summary.circuit_breaker_until >= before + timedelta(hours=5, minutes=59)
+    assert len(session.server_updates) == 1
+    _verify_quarantine_artifact(
+        summary=summary,
+        run_row=session.added_runs[0],
+        expected_dir=settings.quarantine_dir,
+        expected_substrings=[b"/hf-sys/hf-lib.php", b"__HFUID"],
+    )
+
+
+def test_fix001_normal_noscript_page_does_not_false_positive_challenge() -> None:
+    response = httpx.Response(
+        200,
+        text=(
+            "<html><body><noscript>Please enable JavaScript for analytics.</noscript>"
+            "<table class='table table-striped table-hover'></table></body></html>"
+        ),
+    )
+    assert BaseRankingScraper._is_challenge_response(response) is False
+
+
+def test_fix002_play_golden_diamwall_http513_triggers_blocked_challenge_and_cb(
+    tmp_path: Path,
+) -> None:
+    settings = _make_settings(tmp_path)
+    scraper = PlayGoldenScraper(settings, retry_delays=(0.0, 0.0))
+    base_url = "https://play-golden.online"
+    server = _make_target_server("play_golden", base_url, min_records_expected=50)
+    session = FakeAsyncSession(server)
+    diamwall_html = _load_fixture_bytes("golden_diamwall_513.html")
+
+    async def execute() -> ScrapeRunSummary:
+        with respx.mock(assert_all_called=True) as mock_router:
+            mock_router.get(f"{base_url}/ranking/characters?page=1").mock(
+                return_value=httpx.Response(
+                    513,
+                    headers={
+                        "server": "openresty",
+                        "set-cookie": "__diamwall=0x3439887867; Path=/; Secure",
+                    },
+                    content=diamwall_html,
+                )
+            )
+            return await scraper.run(cast(AsyncSession, session), trigger_type="scheduled_12h")
+
+    before = datetime.now(UTC)
+    summary = _run_async(execute())
+
+    assert summary.status == "BLOCKED_CHALLENGE"
+    assert summary.http_status_code == 513
+    assert summary.records_persisted == 0
+    assert summary.circuit_breaker_until is not None
+    assert summary.circuit_breaker_until >= before + timedelta(hours=5, minutes=59)
+    assert len(session.server_updates) == 1
+    _verify_quarantine_artifact(
+        summary=summary,
+        run_row=session.added_runs[0],
+        expected_dir=settings.quarantine_dir,
+        expected_substrings=[b"Verifying your browser | DiamWall", b"/.well-known/diamwall/"],
+    )
+
+
+def test_fix002_diamwall_513_cookie_correlation_and_negative_guards() -> None:
+    # HTTP 513 with __diamwall cookie and empty body -> challenge (defense in depth)
+    resp_513_cookie = httpx.Response(
+        513,
+        headers=[("Set-Cookie", "other=1"), ("Set-Cookie", "__diamwall=0xabc; Path=/")],
+        content=b"",
+    )
+    assert BaseRankingScraper._is_challenge_response(resp_513_cookie) is True
+
+    # Generic HTTP 513 without DiamWall markers/cookie -> NOT a challenge
+    resp_513_generic = httpx.Response(513, text="Upstream custom proxy error")
+    assert BaseRankingScraper._is_challenge_response(resp_513_generic) is False
+
+    # HTTP 200 renewing __diamwall cookie with normal HTML -> NOT a challenge
+    resp_200_cookie = httpx.Response(
+        200,
+        headers={"Set-Cookie": "__diamwall=0xabc; Path=/"},
+        text="<html><body><table class='table-ranking'></table></body></html>",
+    )
+    assert BaseRankingScraper._is_challenge_response(resp_200_cookie) is False
+
+
+def test_fix003_chronicle_real_top_routes_layout_and_page2_404_stop(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    scraper = ChronicleScraper(settings, retry_delays=(0.0, 0.0))
+    base_url = "https://play-chronicle.com"
+    server = _make_target_server("chronicle", base_url, min_records_expected=5)
+    session = FakeAsyncSession(server)
+
+    player_html = _load_fixture_bytes("chronicle_real_player_page1.html")
+    guild_html = _load_fixture_bytes("chronicle_real_guild_page1.html")
+    empty_job_html = (
+        b'<div class="table-responsive"><table class="table table-striped table-hover">'
+        b"<thead><tr><th>#</th><th>Character</th><th>Guild</th>"
+        b"<th>Job K/D Ratio</th><th>Job Points</th></tr></thead></table></div>"
+    )
+
+    async def execute() -> ScrapeRunSummary:
+        with respx.mock(assert_all_called=True) as mock_router:
+            mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
+                return_value=httpx.Response(200, content=player_html)
+            )
+            mock_router.get(f"{base_url}/ranking/top-player-2.html").mock(
+                return_value=httpx.Response(404, text="Not Found")
+            )
+            mock_router.get(f"{base_url}/ranking/top-job-1.html").mock(
+                return_value=httpx.Response(200, content=empty_job_html)
+            )
+            mock_router.get(f"{base_url}/ranking/top-guild-1.html").mock(
+                return_value=httpx.Response(200, content=guild_html)
+            )
+            mock_router.get(f"{base_url}/ranking/top-guild-2.html").mock(
+                return_value=httpx.Response(404, text="Not Found")
+            )
+            return await scraper.run(cast(AsyncSession, session), trigger_type="manual")
+
+    summary = _run_async(execute())
+
+    assert summary.status == "SUCCESS"
+    assert summary.records_extracted == 10
+    assert summary.records_persisted == 10
+    assert summary.validation_errors_count == 0
+    assert "Roc" in session.char_ids
+    assert "AmericanPIE" in session.guild_ids
+    assert session.guild_snapshot_chunks[0][0]["extra_metrics"] == {"guild_level": 5}
+
+
+def test_fix003_chronicle_page1_404_still_fails_as_http_error(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    scraper = ChronicleScraper(settings, retry_delays=(0.0, 0.0))
+    base_url = "https://play-chronicle.com"
+    server = _make_target_server("chronicle", base_url, min_records_expected=5)
+    session = FakeAsyncSession(server)
+
+    async def execute() -> ScrapeRunSummary:
+        with respx.mock(assert_all_called=True) as mock_router:
+            mock_router.get(f"{base_url}/ranking/top-player-1.html").mock(
+                return_value=httpx.Response(404, text="Not Found")
+            )
+            return await scraper.run(cast(AsyncSession, session), trigger_type="manual")
+
+    summary = _run_async(execute())
+    assert summary.status == "HTTP_ERROR"
+    assert summary.http_status_code == 404

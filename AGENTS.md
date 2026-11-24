@@ -21,7 +21,7 @@ Este arquivo define as regras obrigatórias para qualquer agente de execução (
 - **Orquestração:** Prefect 3 (self-hosted)
 - **Cliente HTTP & Parsing:** `httpx[http2]` (`AsyncClient`), `lxml`, `beautifulsoup4`, `orjson`
 - **Validação & Configuração:** Pydantic v2 (`pydantic`, `pydantic-settings`)
-- **Persistência & Migrações:** SQLAlchemy 2.0 (`Mapped[...]`, `asyncpg` via `postgresql+asyncpg://`), Alembic, PostgreSQL 16
+- **Persistência & Migrações:** SQLAlchemy 2.0 (`Mapped[...]`, `asyncpg` via `postgresql+asyncpg://` no `scraper-worker` e em `alembic/env.py`; `psycopg` síncrono via `postgresql+psycopg://` permitido especificamente em `src/dashboard/` reutilizando `psycopg[binary]`), Alembic, PostgreSQL 16
 - **Observabilidade:** `structlog` (logs estruturados em JSON contextualizados com `server_id` e `run_id`)
 
 ### Proibições Estritas
@@ -45,13 +45,18 @@ Este arquivo define as regras obrigatórias para qualquer agente de execução (
 
 ```text
 .
-├── docs/designs/          # Memória do Elefante (SITEMAP.md e design docs aprovados)
+├── docs/
+│   ├── designs/           # Memória do Elefante (SITEMAP.md e design docs aprovados)
+│   ├── egm/               # Relatórios de revisão EGM e drift reports
+│   └── backlog/           # Índice BACKLOG.md + itens individuais em fix/ e feature/
 ├── src/
-│   ├── core/              # config.py, database.py, logging.py
+│   ├── core/              # config.py, database.py, logging.py, notifications.py
 │   ├── models/            # pydantic_schemas.py, db_models.py
 │   ├── scrapers/          # base.py, chronicle.py, electus.py, golden.py
-│   └── flows/             # tasks.py, orchestrator.py
-├── alembic/               # Migrações de schema, partições e views analíticas SQL
+│   ├── flows/             # tasks.py, orchestrator.py
+│   └── dashboard/         # config.py, db.py, schemas.py, queries.py, app.py (read-only Streamlit)
+├── scripts/               # Scripts operacionais (ex.: provision_readonly_role.sh)
+├── alembic/               # Migrações de schema, partições, views analíticas e índices SQL
 ├── tests/                 # Testes unitários (parsers, validação) e fixtures/
 ├── quarantine/            # Dead-letter local (.html.gz, ignorado no git)
 └── pyproject.toml         # Dependências + configuração de ruff, mypy (strict) e pytest
@@ -82,3 +87,19 @@ uv run --no-sync alembic upgrade head
 ```
 
 > Nenhuma tarefa deve ser considerada concluída se qualquer um dos comandos aplicáveis acima falhar.
+
+---
+
+## 5. Gestão de Backlog (`docs/backlog/`)
+
+- `docs/backlog/BACKLOG.md` registra **apenas mudanças pequenas e pontuais** que não cabem em `docs/designs/` (bugfixes e pequenas melhorias incrementais), com um arquivo dedicado por item em:
+  - `docs/backlog/fix/FIX-NNN_<slug>.md` para correções e bugs.
+  - `docs/backlog/feature/FEAT-NNN_<slug>.md` para pequenas melhorias incrementais.
+- **Fora do backlog:** Features estruturais ou mudanças arquiteturais (novas tabelas, novos serviços/módulos ou dependências relevantes) devem ir **diretamente** para `docs/designs/` via fluxo EGM.
+- **Regra de regressão:** Todo `fix` deve incluir teste unitário de regressão em `tests/` (e fixture estática em `tests/fixtures/` quando envolver HTML/payload) antes de ser marcado como `Done`.
+
+---
+
+## 6. Estilo de Comunicação
+
+- **Respostas sempre concisas:** Seja direto ao ponto, priorize listas curtas/tabelas quando útil e evite repetições, introduções longas ou explicações desnecessárias. Traga detalhes extras apenas quando solicitados ou indispensáveis para decisões/erros.

@@ -33,7 +33,7 @@ services:
     restart: unless-stopped
     command: prefect server start --host 0.0.0.0
     ports:
-      - "4200:4200"
+      - "127.0.0.1:4200:4200"
     environment:
       PREFECT_HOME: /root/.prefect
       PREFECT_SERVER_API_HOST: "0.0.0.0"
@@ -90,6 +90,43 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    mem_limit: 768m
+    cpus: "1.0"
+    restart: unless-stopped
+    command:
+      - streamlit
+      - run
+      - src/dashboard/app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DASHBOARD_DATABASE_URL: ${DASHBOARD_DATABASE_URL:-}
+      DASHBOARD_CACHE_TTL_SECONDS: ${DASHBOARD_CACHE_TTL_SECONDS:-600}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MALLOC_ARENA_MAX: "2"
+    networks:
+      - sro_network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8501/_stcore/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   sro_network:

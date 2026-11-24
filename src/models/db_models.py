@@ -79,6 +79,12 @@ class ScrapeRun(Base):
             ")",
             name="ck_scrape_runs_status",
         ),
+        Index(
+            "idx_scrape_runs_server_latest",
+            "server_id",
+            text("created_at DESC"),
+            postgresql_where=text("status IN ('SUCCESS', 'PARTIAL_SUCCESS')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

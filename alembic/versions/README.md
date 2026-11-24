@@ -10,10 +10,13 @@ Linear PostgreSQL 16 Alembic migration chain defining the core relational schema
 - `[002_analytical_views.py:revision]` (`"002_analytical_views"`), `[002_analytical_views.py:down_revision]` (`"001_initial_schema"`), `[002_analytical_views.py:branch_labels]` (`None`), `[002_analytical_views.py:depends_on]` (`None`): analytical views migration metadata.
 - `[002_analytical_views.py:upgrade]`: creates or replaces analytical views `v_character_activity_deltas`, `v_bot_vs_donor_classification`, `v_guild_turnover_dominance`, `v_race_balance_ch_vs_eu`, and `v_server_retention_weekly`.
 - `[002_analytical_views.py:downgrade]`: drops `v_server_retention_weekly`, `v_race_balance_ch_vs_eu`, `v_guild_turnover_dominance`, `v_bot_vs_donor_classification`, and `v_character_activity_deltas` with `IF EXISTS`.
+- `[003_dashboard_indexes.py:revision]` (`"003_dashboard_indexes"`), `[003_dashboard_indexes.py:down_revision]` (`"002_analytical_views"`), `[003_dashboard_indexes.py:branch_labels]` (`None`), `[003_dashboard_indexes.py:depends_on]` (`None`): dashboard partial index migration metadata.
+- `[003_dashboard_indexes.py:upgrade]`: creates partial index `idx_scrape_runs_server_latest` on `scrape_runs (server_id, created_at DESC) WHERE status IN ('SUCCESS', 'PARTIAL_SUCCESS')`.
+- `[003_dashboard_indexes.py:downgrade]`: drops `idx_scrape_runs_server_latest` with `IF EXISTS`.
 - Subdirectories: none.
 
 ## Invariants
-- Linear revision chain: `[002_analytical_views.py:down_revision]` strictly depends on `[001_initial_schema.py:revision]`, and views in `002_analytical_views.py` must be dropped before base tables in `001_initial_schema.py`.
+- Linear revision chain: `[003_dashboard_indexes.py:down_revision]` strictly depends on `[002_analytical_views.py:revision]`, which depends on `[001_initial_schema.py:revision]`, and views in `002_analytical_views.py` must be dropped before base tables in `001_initial_schema.py`.
 - Partitioned fact primary and unique keys include the partition key: `character_snapshots` uses `pk_character_snapshots (id, created_at)` and `uq_char_snapshot_run (scrape_run_id, character_id, created_at)`, and `guild_snapshots` uses `pk_guild_snapshots (id, created_at)` and `uq_guild_snapshot_run (scrape_run_id, guild_id, created_at)`, both partitioned by `RANGE (created_at)`.
 - Domain check and uniqueness constraints in `[001_initial_schema.py:upgrade]`: `scrape_runs.status` is restricted to `('SUCCESS', 'PARTIAL_SUCCESS', 'SCHEMA_DRIFT', 'LOW_COUNT_QUARANTINE', 'BLOCKED_CHALLENGE', 'TARGET_MAINTENANCE', 'HTTP_ERROR')`; `characters.race` is restricted to `('CH', 'EU', 'UNK')`; `uq_char_per_server (server_id, char_name)` and `uq_guild_per_server (server_id, guild_name)` enforce per-server natural uniqueness.
 - Idempotent server seeding: initial rows in `servers` (`chronicle`, `electus`, `play_golden`) use `ON CONFLICT (id) DO NOTHING`.
@@ -24,6 +27,7 @@ Linear PostgreSQL 16 Alembic migration chain defining the core relational schema
 - Executes raw PostgreSQL 16 DDL and DML statements via `alembic.op.execute`.
 - `[001_initial_schema.py:upgrade]` installs the `pgcrypto` database extension (not removed by `[001_initial_schema.py:downgrade]`), mutates database schema objects (tables, partitions, constraints, indexes), and inserts seed rows into `servers`.
 - `[002_analytical_views.py:upgrade]` creates or replaces 5 SQL views in the target database schema; `[002_analytical_views.py:downgrade]` drops those 5 views.
+- `[003_dashboard_indexes.py:upgrade]` creates partial index `idx_scrape_runs_server_latest` on `scrape_runs`; `[003_dashboard_indexes.py:downgrade]` drops that index.
 
 ## Verification
 - Run: `pytest`

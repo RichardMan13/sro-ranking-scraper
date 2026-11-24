@@ -12,11 +12,17 @@ from lxml import etree
 from lxml import html as lxml_html
 
 from src.models.pydantic_schemas import _EMPTY_PLACEHOLDERS
-from src.scrapers.base import BaseRankingScraper, CategoryFetchResult, PagePayload
+from src.scrapers.base import (
+    BaseRankingScraper,
+    CategoryFetchResult,
+    PagePayload,
+    TransportFetchError,
+)
 
 _PLAYER_MAX_PAGES: Final[int] = 10
 _JOB_MAX_PAGES: Final[int] = 5
 _GUILD_MAX_PAGES: Final[int] = 2
+_CHRONICLE_TABLE_CLASSES: Final[tuple[str, ...]] = ("table", "table-striped", "table-hover")
 
 _EMPTY_NOTICE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:"
@@ -84,7 +90,7 @@ def _strip_rank_prefix(raw_rank: str | None) -> str | None:
 
 def _extract_table_rows(
     content: bytes,
-    table_class: str,
+    table_classes: tuple[str, ...],
     encoding: str | None,
 ) -> list[etree._Element]:
     if not content.strip():
@@ -100,10 +106,10 @@ def _extract_table_rows(
     except etree.ParserError:
         return []
 
-    tables = _xpath_elements(
-        tree,
-        f"//table[contains(concat(' ', normalize-space(@class), ' '), ' {table_class} ')]",
+    class_predicates = " and ".join(
+        f"contains(concat(' ', normalize-space(@class), ' '), ' {cls} ')" for cls in table_classes
     )
+    tables = _xpath_elements(tree, f"//table[{class_predicates}]")
     rows: list[etree._Element] = []
     for table in tables:
         if _xpath_elements(table, "./tbody"):
@@ -149,35 +155,6 @@ def _extract_race_from_cell(cell: etree._Element) -> str | None:
     return None
 
 
-def _extract_extra_value(
-    row: etree._Element,
-    cells: list[etree._Element],
-    *,
-    tr_attr: str,
-    field_name: str,
-    css_class: str,
-    col_index: int,
-) -> str | None:
-    attr_val = row.get(tr_attr)
-    if attr_val is not None:
-        cleaned = attr_val.strip()
-        if cleaned and cleaned not in _EMPTY_PLACEHOLDERS:
-            return cleaned
-    tagged = _xpath_elements(
-        row,
-        f".//*[@data-field='{field_name}' or "
-        f"contains(concat(' ', normalize-space(@class), ' '), ' {css_class} ')]",
-    )
-    if tagged:
-        text = _element_text(tagged[0])
-        if text and text not in _EMPTY_PLACEHOLDERS:
-            return text
-    col_val = _cell_text(cells, col_index)
-    if col_val and col_val not in _EMPTY_PLACEHOLDERS:
-        return col_val
-    return None
-
-
 def _parse_optional_numeric(raw_val: str) -> int | float | str:
     compact = raw_val.replace(",", "").strip()
     if compact.isascii() and compact.isdigit():
@@ -202,7 +179,7 @@ class ChronicleScraper(BaseRankingScraper):
         client: httpx.AsyncClient,
         base_url: str,
         *,
-        route_path: str,
+        route_template: str,
         max_pages: int,
         category: str,
         row_mapper: Callable[[etree._Element, list[etree._Element]], dict[str, Any]],
@@ -213,8 +190,13 @@ class ChronicleScraper(BaseRankingScraper):
         last_status: int | None = None
 
         for page in range(1, max_pages + 1):
-            url = f"{clean_base}{route_path}?page={page}"
-            response = await self._fetch_url(client, url, category=category)
+            url = f"{clean_base}{route_template.format(page=page)}"
+            try:
+                response = await self._fetch_url(client, url, category=category)
+            except TransportFetchError as exc:
+                if page > 1 and exc.status_code == 404:
+                    break
+                raise
             last_status = response.status_code
             raw_payloads.append(
                 PagePayload(
@@ -225,7 +207,11 @@ class ChronicleScraper(BaseRankingScraper):
                 )
             )
 
-            rows = _extract_table_rows(response.content, "ranking-table", response.encoding)
+            rows = _extract_table_rows(
+                response.content,
+                _CHRONICLE_TABLE_CLASSES,
+                response.encoding,
+            )
             page_records: list[dict[str, Any]] = []
             for tr in rows:
                 cells = _xpath_elements(tr, "./td")
@@ -244,32 +230,9 @@ class ChronicleScraper(BaseRankingScraper):
         )
 
     @staticmethod
-    def _map_player_row(tr: etree._Element, cells: list[etree._Element]) -> dict[str, Any]:
+    def _map_player_row(_tr: etree._Element, cells: list[etree._Element]) -> dict[str, Any]:
         char_name = _extract_char_name(cells[1]) if len(cells) > 1 else None
         race = _extract_race_from_cell(cells[1]) if len(cells) > 1 else None
-
-        extra_metrics: dict[str, Any] = {}
-        pvp_kd = _extract_extra_value(
-            tr,
-            cells,
-            tr_attr="data-pvp-kd",
-            field_name="pvp_kd",
-            css_class="pvp-kd",
-            col_index=7,
-        )
-        if pvp_kd is not None:
-            extra_metrics["pvp_kd"] = pvp_kd
-
-        unique_points_raw = _extract_extra_value(
-            tr,
-            cells,
-            tr_attr="data-unique-points",
-            field_name="unique_points",
-            css_class="unique-points",
-            col_index=8,
-        )
-        if unique_points_raw is not None:
-            extra_metrics["unique_points"] = _parse_optional_numeric(unique_points_raw)
 
         return {
             "rank": _strip_rank_prefix(_cell_text(cells, 0)),
@@ -278,26 +241,35 @@ class ChronicleScraper(BaseRankingScraper):
             "guild_name": _cell_text(cells, 2),
             "level": _cell_text(cells, 3),
             "item_points": _cell_text(cells, 4),
-            "honor_points": _cell_text(cells, 5),
-            "title": _cell_text(cells, 6),
-            "extra_metrics": extra_metrics,
+            "extra_metrics": {},
         }
 
     @staticmethod
     def _map_job_row(_tr: etree._Element, cells: list[etree._Element]) -> dict[str, Any]:
         char_name = _extract_char_name(cells[1]) if len(cells) > 1 else None
+        extra_metrics: dict[str, Any] = {}
+        kd_ratio = _cell_text(cells, 3)
+        if kd_ratio is not None and kd_ratio not in _EMPTY_PLACEHOLDERS:
+            extra_metrics["job_kd_ratio"] = kd_ratio
+
         return {
             "rank": _strip_rank_prefix(_cell_text(cells, 0)),
             "char_name": char_name,
             "guild_name": _cell_text(cells, 2),
-            "job_type": _cell_text(cells, 3),
-            "job_level": _cell_text(cells, 4),
-            "job_exp": _cell_text(cells, 5),
+            "job_type": None,
+            "job_level": None,
+            "job_points": _cell_text(cells, 4),
+            "extra_metrics": extra_metrics,
         }
 
     @staticmethod
     def _map_guild_row(_tr: etree._Element, cells: list[etree._Element]) -> dict[str, Any]:
         guild_name = _extract_char_name(cells[1]) if len(cells) > 1 else None
+        extra_metrics: dict[str, Any] = {}
+        guild_level = _cell_text(cells, 2)
+        if guild_level is not None and guild_level not in _EMPTY_PLACEHOLDERS:
+            extra_metrics["guild_level"] = _parse_optional_numeric(guild_level)
+
         raw_members = _cell_text(cells, 3)
         if raw_members is not None and "/" in raw_members:
             raw_members = raw_members.split("/", maxsplit=1)[0].strip()
@@ -305,10 +277,11 @@ class ChronicleScraper(BaseRankingScraper):
         return {
             "rank": _strip_rank_prefix(_cell_text(cells, 0)),
             "guild_name": guild_name,
-            "master_name": _cell_text(cells, 2),
+            "master_name": None,
             "members_count": raw_members,
             "total_item_points": _cell_text(cells, 4),
-            "fortress_held": _cell_text(cells, 5),
+            "fortress_held": None,
+            "extra_metrics": extra_metrics,
         }
 
     async def fetch_player_pages(
@@ -320,7 +293,7 @@ class ChronicleScraper(BaseRankingScraper):
         return await self._fetch_paginated_html(
             client,
             base_url,
-            route_path="/ranking/player",
+            route_template="/ranking/top-player-{page}.html",
             max_pages=_PLAYER_MAX_PAGES,
             category="player",
             row_mapper=self._map_player_row,
@@ -335,7 +308,7 @@ class ChronicleScraper(BaseRankingScraper):
         return await self._fetch_paginated_html(
             client,
             base_url,
-            route_path="/ranking/job",
+            route_template="/ranking/top-job-{page}.html",
             max_pages=_JOB_MAX_PAGES,
             category="job",
             row_mapper=self._map_job_row,
@@ -350,7 +323,7 @@ class ChronicleScraper(BaseRankingScraper):
         return await self._fetch_paginated_html(
             client,
             base_url,
-            route_path="/ranking/guild",
+            route_template="/ranking/top-guild-{page}.html",
             max_pages=_GUILD_MAX_PAGES,
             category="guild",
             row_mapper=self._map_guild_row,

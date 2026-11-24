@@ -55,6 +55,10 @@ CHALLENGE_HTML_MARKERS: Final[tuple[str, ...]] = (
     "cf-chl-bypass",
     "just a moment...",
     "attention required! | cloudflare",
+    "/hf-sys/hf-lib.php",
+    'createcookie("__hfuid"',
+    "verifying your browser | diamwall",
+    "/.well-known/diamwall/",
 )
 
 MAINTENANCE_HTML_MARKERS: Final[tuple[str, ...]] = (
@@ -281,8 +285,11 @@ def _reconcile_jobs_into_players(
         reconciled.append(
             player.model_copy(
                 update={
-                    "job_type": job.job_type,
-                    "job_level": job.job_level,
+                    "job_type": job.job_type if job.job_type is not None else player.job_type,
+                    "job_level": job.job_level if job.job_level is not None else player.job_level,
+                    "job_points": (
+                        job.job_points if job.job_points is not None else player.job_points
+                    ),
                     "job_exp": job.job_exp if job.job_exp is not None else player.job_exp,
                     "guild_name": (
                         player.guild_name if player.guild_name is not None else job.guild_name
@@ -364,6 +371,10 @@ class BaseRankingScraper(ABC):
         if response.status_code in CHALLENGE_HTTP_STATUSES:
             return True
         if response.headers.get("cf-mitigated", "").strip().lower() == "challenge":
+            return True
+        if response.status_code == 513 and any(
+            "__diamwall" in cookie.lower() for cookie in response.headers.get_list("set-cookie")
+        ):
             return True
         lower_text = response.text.lower()
         return any(marker in lower_text for marker in CHALLENGE_HTML_MARKERS)

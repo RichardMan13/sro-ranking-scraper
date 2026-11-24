@@ -250,16 +250,25 @@ class RawJobRankingItem(BaseModel):
 
     rank: int = Field(ge=1)
     char_name: str = Field(min_length=1, max_length=64)
-    job_type: Literal["TRADER", "THIEF", "HUNTER"]
-    job_level: int = Field(ge=1, le=140)
+    job_type: Literal["TRADER", "THIEF", "HUNTER"] | None = None
+    job_level: int | None = Field(default=None, ge=1, le=140)
+    job_points: int | None = Field(default=None, ge=0)
     job_exp: int | None = Field(default=None, ge=0)
     guild_name: str | None = None
     extra_metrics: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("rank", "job_level", mode="before")
+    @field_validator("rank", mode="before")
     @classmethod
     def clean_required_int(cls, v: Any) -> int:
         return _clean_required_int(v)
+
+    @field_validator("job_level", mode="before")
+    @classmethod
+    def clean_optional_job_level(cls, v: Any) -> int | None:
+        if v is None:
+            return None
+        _reject_bool(v)
+        return _clean_int_numbers(v)
 
     @field_validator("char_name", "guild_name", mode="before")
     @classmethod
@@ -269,9 +278,17 @@ class RawJobRankingItem(BaseModel):
     @field_validator("job_type", mode="before")
     @classmethod
     def normalize_job_type(cls, v: Any) -> str | None:
-        return _normalize_job_type(v)
+        if v is None:
+            return None
+        cleaned = str(v).strip()
+        if cleaned in _EMPTY_PLACEHOLDERS:
+            return None
+        mapped = _JOB_TYPE_MAPPING.get(cleaned.upper())
+        if mapped is None:
+            raise ValueError(f"Unknown job_type: {v!r}")
+        return mapped
 
-    @field_validator("job_exp", mode="before")
+    @field_validator("job_points", "job_exp", mode="before")
     @classmethod
     def clean_int_numbers(cls, v: Any) -> int | None:
         return _clean_int_numbers(v)

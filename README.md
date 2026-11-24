@@ -38,6 +38,7 @@ A containerized, HTTP-first data pipeline that extracts public player, guild, an
   - [src/models](./src/models/README.md) — SQLAlchemy 2.0 PostgreSQL ORM models and Pydantic v2 raw ranking validation/normalization schemas.
   - [src/scrapers](./src/scrapers/README.md) — HTTP/2 scraper engine (`BaseRankingScraper`), target server parsers (`ChronicleScraper`, `ElectusScraper`, `PlayGoldenScraper`), circuit breaker, integrity guards, gzip quarantine, and bulk persistence.
   - [src/flows](./src/flows/README.md) — Prefect 3 tasks, scheduled/post-FW/manual flows, dynamic cron deployment builder, and CLI entrypoint.
+  - [src/dashboard](./src/dashboard/README.md) — Isolated read-only Streamlit + Altair analytical dashboard (`psycopg` sync engine, partition-pruned queries, 5 lazy-loaded community views).
 
 ## Global Invariants
 - **Append-Only Partitioned Fact Tables:** `character_snapshots` and `guild_snapshots` use PostgreSQL `RANGE (created_at)` partitioning with composite primary keys `(id, created_at)` and unique constraints including `created_at`; every Prefect flow invokes `ensure_partitions_task` before scraping.
@@ -78,6 +79,9 @@ cp .env.example .env
 | `ELECTUS_CF_CLEARANCE` | Optional `cf_clearance` cookie for Electus Online | *(empty)* |
 | `DISCORD_OPS_WEBHOOK_URL` | Optional Discord webhook for critical operational failure alerts (`https://discord.com/api/webhooks/<id>/<token>`) | *(empty)* |
 | `DISCORD_COMMUNITY_WEBHOOK_URL` | Optional Discord webhook for automatic post-Fortress War summaries | *(empty)* |
+| `DASHBOARD_DB_PASSWORD` | Password used by `scripts/provision_readonly_role.sh` for the `sro_readonly` PostgreSQL role | `CHANGE_ME_READONLY_PASSWORD` |
+| `DASHBOARD_DATABASE_URL` | Sync `psycopg` DSN for `sro_readonly` (URL-encode special characters like `@`, `#`, `:`, `/`) | `postgresql+psycopg://sro_readonly:...@postgres:5432/sro_rankings` |
+| `DASHBOARD_CACHE_TTL_SECONDS` | Streamlit `@st.cache_data` TTL in seconds (`30..3600`) | `600` |
 
 ### Discord Notifications (Optional)
 
@@ -98,25 +102,77 @@ Healthy runs exit with code `0` without alerting; any run ending in a critical f
 
 ## Quick Start (Docker Compose)
 
-The Compose stack defines three services on the internal `sro_network`:
+The Compose stack defines four services on the internal `sro_network`:
 1. **`postgres`** (`postgres:16-alpine`, `mem_limit: 1g`, not exposed on host port `5432`)
-2. **`prefect-server`** (`prefecthq/prefect:3-python3.11`, UI/API on `http://localhost:4200`)
+2. **`prefect-server`** (`prefecthq/prefect:3-python3.11`, bound exclusively to `127.0.0.1:4200:4200`)
 3. **`scraper-worker`** (Python 3.11 non-root `appuser`, `mem_limit: 512m`, mounts `./quarantine:/app/quarantine`)
+4. **`dashboard`** (Python 3.11 shared `Dockerfile`, `mem_limit: 768m`, `cpus: "1.0"`, internal port `8501` without host `0.0.0.0` publication)
 
 ```bash
-# 1. Build the scraper-worker image
+# 1. Build scraper-worker and dashboard images
 docker compose build
 
 # 2. Start PostgreSQL 16, Prefect 3 server, and scraper-worker
-docker compose up -d
+docker compose up -d postgres prefect-server scraper-worker
 
-# 3. Verify / apply database migrations, monthly partitions, and analytical SQL views
+# 3. Verify / apply database migrations (001..003)
 docker compose exec scraper-worker alembic upgrade head
 
-# 4. Check container status and logs
+# 4. Provision the dedicated read-only PostgreSQL role (`sro_readonly`)
+./scripts/provision_readonly_role.sh
+
+# 5. Start the analytical dashboard container
+docker compose up -d dashboard
+
+# 6. Check container status and logs
 docker compose ps
-docker compose logs -f scraper-worker
+docker compose logs -f scraper-worker dashboard
 ```
+
+### Analytical Dashboard Deployment (Traefik / EasyPanel on VPS)
+
+The `dashboard` service intentionally does **not** publish port `8501` on `0.0.0.0`. On a VPS running Traefik or EasyPanel, attach the `dashboard` container to the external proxy network via a local production override file (not committed to git), e.g. `docker-compose.prod.yml`:
+
+```yaml
+services:
+  dashboard:
+    networks:
+      - sro_network
+      - easypanel
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=easypanel"
+      - "traefik.http.routers.sro-dashboard.rule=Host(`dashboard.example.com`)"
+      - "traefik.http.routers.sro-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.sro-dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.sro-dashboard.middlewares=sro-dash-auth@docker,sro-dash-ratelimit@docker"
+      - "traefik.http.middlewares.sro-dash-auth.basicauth.users=admin:$$apr1$$..."
+      - "traefik.http.middlewares.sro-dash-ratelimit.ratelimit.average=20"
+      - "traefik.http.middlewares.sro-dash-ratelimit.ratelimit.burst=40"
+      - "traefik.http.services.sro-dashboard.loadbalancer.server.port=8501"
+
+networks:
+  easypanel:
+    external: true
+```
+
+Deploy with:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+Ensure the proxy forwards `Host`, `X-Forwarded-Proto: https`, `Upgrade`, and `Connection` headers for Streamlit WebSockets (`/_stcore/stream`) with an idle timeout `>= 300s`.
+
+### Accessing Prefect 3 UI via SSH Tunnel
+
+Because `prefect-server` is bound to `127.0.0.1:4200:4200`, open an SSH tunnel from your workstation to inspect the Prefect UI securely:
+
+```bash
+ssh -L 4200:127.0.0.1:4200 user@your-vps-ip
+```
+
+Then open `http://localhost:4200` locally.
 
 For local (non-containerized) development against a reachable PostgreSQL instance, run:
 

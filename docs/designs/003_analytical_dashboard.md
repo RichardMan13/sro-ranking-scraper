@@ -1,7 +1,7 @@
 # Dashboard Analítico Read-Only em Streamlit (v3.0)
 
 *   **Author:** richardman13
-*   **Status:** Approved
+*   **Status:** Implemented
 *   **Date:** 2026-11-22
 *   **Approved Date:** 2026-11-23
 *   **Source Brief:** [concepts_brief.md](../egm/003_analytical_dashboard/concepts_brief.md)
@@ -12,7 +12,7 @@
 
 A versão **v3.0** adiciona uma camada de visualização analítica somente leitura (*read-only*) ao **SRO Ranking Scraper** (*Silkroad Online* — **SRO**) usando **Streamlit**, voltada para análise de comunidade por um único usuário. O serviço executa como container dedicado e sempre ativo na **VPS Hostinger KVM 2** (Debian 13, 8 GB RAM, 2 vCPUs, ~100 GB de disco), atrás de domínio HTTPS gerenciado por **Traefik/EasyPanel** (terminação TLS, autenticação na borda e suporte a WebSockets, sem exposição direta da porta `8501`).
 
-O dashboard expõe 5 visões interativas por servidor (dimensionado para até **10 servidores** e **6 meses** de histórico), isolando suas dependências Python da imagem do `scraper-worker` e conectando-se ao PostgreSQL 16 exclusivamente por meio de uma role de leitura dedicada (`sro_readonly`) protegida por guardrails tanto no banco quanto na sessão SQLAlchemy. Telemetria operacional (`scrape_runs`, estado do Circuit Breaker e quarentena em `./quarantine/`) permanece fora do escopo deste dashboard, sob responsabilidade da UI do Prefect e de consultas manuais via SQL/CLI.
+O dashboard expõe 5 visões interativas por servidor (dimensionado para até **10 servidores** e **6 meses** de histórico), mantendo seu processo, configuração (`DashboardSettings`) e container isolados do `scraper-worker` e conectando-se ao PostgreSQL 16 exclusivamente por meio de uma role de leitura dedicada (`sro_readonly`) protegida por guardrails tanto no banco quanto na sessão SQLAlchemy. Telemetria operacional (`scrape_runs`, estado do Circuit Breaker e quarentena em `./quarantine/`) permanece fora do escopo deste dashboard, sob responsabilidade da UI do Prefect e de consultas manuais via SQL/CLI.
 
 ## The Problem
 
@@ -20,14 +20,14 @@ A v1.0 do **SRO Ranking Scraper** ([Design 001](001_sro_ranking_scraper_pipeline
 
 1. **Consumo manual via SQL:** Consultar evolução de `item_points` (pontuação de equipamento do personagem), dominância de guildas, balanço de raças (`CH` = *Chinese*, `EU` = *European*, `UNK` = *Unknown*), retenção semanal e classificação comportamental (Bot vs Whale) exige conexão direta ao banco e queries manuais repetitivas.
 2. **Risco de degradação sobre o banco em consultas analíticas:** As views atuais aplicam `LAG()` sem corte temporal prévio (`v_character_activity_deltas`) e fazem `JOIN` em `character_snapshots` sem filtrar `created_at` (`v_guild_turnover_dominance`, `v_race_balance_ch_vs_eu`), impedindo *partition pruning* e expondo o PostgreSQL de 1 GB de RAM (`work_mem=64MB`) a leituras de todas as partições mensais e risco de OOM durante coletas do `scraper-worker`.
-3. **Ausência de publicação segura na VPS:** Expor uma interface web diretamente por porta Docker (`8501:8501`) ou acoplar bibliotecas de UI (`streamlit`, `pandas`, `pyarrow`) ao `scraper-worker` violaria tanto o isolamento de rede da VPS quanto o teto estrito de 512 MB de RAM do worker.
+3. **Ausência de publicação segura na VPS:** Expor uma interface web diretamente por porta Docker (`8501:8501`) ou executar o runtime de UI (`streamlit`) no mesmo processo/container do `scraper-worker` violaria tanto o isolamento de rede da VPS quanto o teto estrito de 512 MB de RAM do worker.
 
 A solução entrega uma interface web single-page em Streamlit em container separado, alimentada por queries read-only com *partition pruning* determinístico e cache em memória, publicada exclusivamente atrás do proxy reverso Traefik/EasyPanel.
 
 ## Goals
 
 *   **G1 (5 Visões Analíticas da Comunidade):** Disponibilizar, por servidor ativo selecionado e sem SQL manual, cinco visões interativas com carregamento *lazy* (apenas a visão ativa executa consulta):
-    1. Evolução diária de `item_points` por faixa de rank (curvas agregadas de média, mediana P50 e P90 para Top 10, Top 50 e Top 100 + curva única do teto Rank #1 em janela padrão de 30 dias expansível até 180 dias, com drill-down opcional de `item_points` e `rank_position` para Top 5–10 personagens individuais).
+    1. Evolução diária de `item_points` por faixa de rank (curvas agregadas de média, mediana P50 e P90 + curva única do teto Rank #1 com seletor de faixa Top 10 / Top 50 / Top 100 em janela padrão de 30 dias expansível até 180 dias, com drill-down opcional de `item_points` e `rank_position` para Top 5–10 personagens individuais).
     2. Dominância de guildas no Top 100 (exibindo contagem absoluta de jogadores ranqueados junto ao percentual sobre a amostra e nominal sobre 100 vagas, rotulando `[SEM GUILDA]` com clareza).
     3. Balanço de raças `CH` vs `EU` (tratando servidores 100% `CH` e registros `UNK` sem quebra de gráfico ou legenda).
     4. Retenção semanal (janela padrão de 12 semanas alinhada à segunda-feira UTC, expansível até 26 semanas, sinalizando visualmente a semana corrente incompleta e tratando servidores com menos de 2 snapshots).
@@ -35,7 +35,7 @@ A solução entrega uma interface web single-page em Streamlit em container sepa
 *   **G2 (Latência e Orçamento de Recursos na VPS):** Carregar qualquer uma das 5 visões para qualquer servidor (até 10 servidores e 6 meses de histórico) em **menos de 5 segundos** via domínio HTTPS, mantendo o container `dashboard` dentro de `mem_limit: 768m` (`MALLOC_ARENA_MAX=2`) e `cpus: "1.0"`, sem impactar `scraper-worker` (512 MB) nem `postgres` (1 GB).
 *   **G3 (Defesa Read-Only em Duas Camadas):** Garantir que o dashboard utilize exclusivamente a role dedicada `sro_readonly` via `DASHBOARD_DATABASE_URL` (`GRANT SELECT` + limites aplicados na própria role via `ALTER ROLE sro_readonly`) somada a guardrails de sessão na conexão SQLAlchemy e pool mínimo (`pool_size=2, max_overflow=0, pool_timeout=5`).
 *   **G4 (Publicação Segura e Hardening na VPS):** Expor o dashboard somente atrás do proxy reverso Traefik/EasyPanel em topologia *dual-network* com HTTPS (Let's Encrypt), autenticação na borda (Basic Auth + rate-limiting) para 1 usuário e suporte a WebSockets (`/_stcore/stream`), sem publicar a porta `8501` em `0.0.0.0`, sem expor a porta `5432` no host e restringindo a porta `4200` do `prefect-server` para `127.0.0.1:4200:4200`.
-*   **G5 (Isolamento de Dependências e Qualidade de Código):** Manter o `scraper-worker` livre de dependências de UI (`streamlit`, `altair`, `pandas`, `pyarrow`) via `[project.optional-dependencies]`, manter conformidade com `mypy --strict`, `ruff` e testes unitários (`pytest`) para a camada pura de queries/schemas, e exibir frescor discreto (`Último snapshot: YYYY-MM-DD HH:MM UTC`) no cabeçalho.
+*   **G5 (Dependências Unificadas e Qualidade de Código):** Declarar `streamlit` e `altair` em `[project].dependencies` no `pyproject.toml` como dependências essenciais do projeto (atualizado a pedido do autor durante a implementação), manter conformidade com `mypy --strict`, `ruff` e testes unitários (`pytest`) para a camada pura de queries/schemas, e exibir frescor discreto (`Último snapshot: YYYY-MM-DD HH:MM UTC`) no cabeçalho.
 
 ## Non-Goals
 
@@ -84,7 +84,7 @@ flowchart LR
             DASH["dashboard (Streamlit) - 768m RAM, 1.0 vCPU, porta interna 8501"]
         end
         subgraph NET["Rede Interna: sro_network"]
-            WORKER["scraper-worker (Prefect 3) - 512m RAM, sem streamlit/pandas"]
+            WORKER["scraper-worker (Prefect 3) - 512m RAM"]
             PREFECT["prefect-server - 127.0.0.1:4200:4200"]
             PG["postgres (PostgreSQL 16) - 1g RAM, sem porta 5432 no host"]
         end
@@ -140,7 +140,7 @@ A proteção contra escrita acidental ou uso indevido da credencial opera no **s
 
 ### 5. Empacotamento Docker, Publicação Traefik/EasyPanel e Hardening Colateral
 
-*   **Isolamento de dependências:** O extra opcional `[dashboard]` no `pyproject.toml` é instalado apenas no build do serviço `dashboard` (via `ARG INSTALL_EXTRAS` no `Dockerfile` compartilhado, onde `curl` já está instalado para o healthcheck). Trade-off consciente: a imagem do `dashboard` herda as dependências base do projeto (`prefect`, `lxml`, etc.) em troca de manter um único `Dockerfile` de manutenção simples, enquanto o `scraper-worker` permanece estritamente livre de `streamlit`, `pandas` e `pyarrow`.
+*   **Empacotamento unificado:** `streamlit` e `altair` são declarados diretamente em `[project].dependencies` no `pyproject.toml` (atualizado durante a implementação) e instalados no `Dockerfile` compartilhado (onde `curl` já está instalado para o healthcheck). Trade-off consciente: manter um único `Dockerfile` e um conjunto unificado de dependências simplifica o build e o ambiente local (`uv`), enquanto `src/dashboard/app.py` permanece livre de imports de `pandas` e o processo `scraper-worker` nunca importa `src.dashboard`, `streamlit` ou `altair` em runtime, preservando seu teto de 512 MB de RAM.
 *   **Publicação via Traefik / EasyPanel (VPS Hostinger KVM 2):**
     *   Topologia **dual-network**: o serviço `dashboard` entra em `sro_network` e na rede externa do proxy (configurada via arquivo override de produção na VPS); caso o proxy opere em modo *host network*, publica-se explicitamente `127.0.0.1:8501:8501` — nunca `0.0.0.0:8501`.
     *   O roteamento HTTPS (Let's Encrypt) aplica Basic Auth para 1 usuário + middleware de *rate-limiting* na borda, encaminha `Host`, `X-Forwarded-Proto: https`, `Upgrade` e `Connection` para WebSockets (`/_stcore/stream`) com idle timeout `>= 300s`, e mantém XSRF/CORS do Streamlit compatíveis com terminação TLS no proxy.
@@ -294,12 +294,12 @@ O trabalho é dividido em **4 fases incrementais** com checkpoints de validaçã
 ### Fase 2: Empacotamento, Camada Pura de Dados (`src/dashboard/`) e Testes Unitários
 
 #### 5. `pyproject.toml` (Modify)
-*   **Type / Scope:** Empacotamento Python, dependências opcionais, marcadores `pytest` e configuração `mypy`.
+*   **Type / Scope:** Empacotamento Python, dependências essenciais, marcadores `pytest` e configuração `mypy`.
 *   **Proposed Changes:**
-    *   Adicionar `[project.optional-dependencies]` com `dashboard = ["streamlit>=1.40.0,<2.0.0", "altair>=5.0.0,<6.0.0"]`, mantendo a chave `dependencies` em `[project]` inalterada para que o `scraper-worker` não instale `streamlit`, `pandas` ou `pyarrow`.
+    *   Adicionar `"streamlit>=1.40.0,<2.0.0"` e `"altair>=5.0.0,<6.0.0"` em `[project].dependencies` (alinhado ao objetivo G5).
     *   Adicionar dois blocos `[[tool.mypy.overrides]]`:
         *   `module = ["streamlit", "streamlit.*", "altair", "altair.*"]` com `ignore_missing_imports = true`.
-        *   `module = ["src.dashboard.app"]` com `disallow_untyped_decorators = false` (necessário para `@st.cache_resource` e `@st.cache_data` quando o extra `[dashboard]` não estiver instalado no `.venv`).
+        *   `module = ["src.dashboard.app"]` com `disallow_untyped_decorators = false` (necessário para `@st.cache_resource` e `@st.cache_data` sob `mypy --strict`).
     *   Registrar marcador `postgres` em `[tool.pytest.ini_options]` (`markers = ["postgres: integration tests requiring a live PostgreSQL 16 instance"]`).
 
 #### 6. `src/dashboard/__init__.py` (Create)
@@ -383,7 +383,7 @@ O trabalho é dividido em **4 fases incrementais** com checkpoints de validaçã
     *   Renderizar na barra lateral: seletor de servidor ativo (se `list_active_servers()` retornar `[]`, exibir `st.info` e encerrar o fluxo), legenda de frescor via `st.caption("Último snapshot: YYYY-MM-DD HH:MM UTC")` (ou `"Sem snapshots registrados"`) e botão **"Atualizar dados"** (`st.cache_data.clear()` + `st.rerun()`).
     *   Renderizar `st.segmented_control` com as 5 visões; se o usuário desmarcar a opção ativa (retorno `None` no Streamlit 1.40+), aplicar fallback automático para a Visão 1.
     *   Implementar os 5 renderizadores `altair`:
-        1. **Visão 1:** seletor `30d`/`90d`/`180d`, linhas de Média/P50/P90 por faixa + linha do teto Rank #1; toggle opcional de drill-down (Top 5–10) plotando `item_points` e `rank_position` (eixo Y invertido: `alt.Scale(reverse=True)`).
+        1. **Visão 1:** seletor de janela `30d`/`90d`/`180d` + `st.segmented_control` de faixa (`Top 10`, `Top 50`, `Top 100`, padrão `Top 100`), plotando linhas de Média/P50/P90 da faixa ativa + linha do teto Rank #1; toggle opcional de drill-down (Top 5–10) plotando `item_points` e `rank_position` (eixo Y invertido: `alt.Scale(reverse=True)`).
         2. **Visão 2:** barras horizontais por guilda exibindo contagem absoluta (`players_in_top_100` / `sample_total_players`), percentual sobre amostra e nominal sobre 100 vagas, destacando `[SEM GUILDA]` + tabela auxiliar.
         3. **Visão 3:** barras/cards com domínio de cores fixo `alt.Scale(domain=["CH", "EU", "UNK"], range=...)` cobrindo 100% `CH` e `UNK`.
         4. **Visão 4:** seletor `12w`/`26w`, gráfico de barras/linha semanal diferenciando visualmente `is_current_week = True` (opacidade/anotação `"Semana em andamento"`).
@@ -391,17 +391,16 @@ O trabalho é dividido em **4 fases incrementais** com checkpoints de validaçã
     *   Tratar explicitamente os 4 estados vazios (`st.info`): servidor sem snapshots, `< 2` snapshots semanais na Visão 4, `0` registros na Visão 5 (`< 7` snapshots em 7 dias) e falha de consulta.
     *   Capturar `SQLAlchemyError` em cada visão, registrar evento JSON via `structlog` (`server_id`, `view_name`, `error_type`, sem credenciais) e exibir mensagem genérica de indisponibilidade via `st.warning` (sem detalhes técnicos ou credenciais).
 
-#### 14. `Dockerfile` (Modify)
+#### 14. `Dockerfile` (Shared — No Changes Required)
 *   **Type / Scope:** Imagem Docker compartilhada entre `scraper-worker` e `dashboard`.
 *   **Proposed Changes:**
-    *   Declarar `ARG INSTALL_EXTRAS=""` antes da instalação do pacote e atualizar `RUN pip install --no-cache-dir .` para `RUN pip install --no-cache-dir ".${INSTALL_EXTRAS}"`.
-    *   Preservar `curl` (já presente no `apt-get install`, usado pelo healthcheck do dashboard) e o `CMD` padrão do `scraper-worker`; o serviço `dashboard` sobrescreve o `command` no `docker-compose.yml` e passa `INSTALL_EXTRAS: "[dashboard]"` em `build.args`.
+    *   Preservar `RUN pip install --no-cache-dir .` (instalando as dependências unificadas de `[project].dependencies`), `curl` (já presente no `apt-get install`, usado pelo healthcheck do dashboard) e o `CMD` padrão do `scraper-worker`; o serviço `dashboard` sobrescreve apenas o `command` no `docker-compose.yml`.
 
 #### 15. `docker-compose.yml` (Modify)
 *   **Type / Scope:** Orquestração de containers e hardening de rede na VPS Hostinger KVM 2.
 *   **Proposed Changes:**
     *   Adicionar serviço `dashboard`:
-        *   `build`: `context: .`, `dockerfile: Dockerfile`, `args: { INSTALL_EXTRAS: "[dashboard]" }`.
+        *   `build`: `context: .`, `dockerfile: Dockerfile`.
         *   Limites: `mem_limit: 768m`, `cpus: "1.0"`, `restart: unless-stopped`.
         *   `depends_on`: `postgres` (`condition: service_healthy`).
         *   `command`: `["streamlit", "run", "src/dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true", "--browser.gatherUsageStats=false"]`.
@@ -453,9 +452,9 @@ O trabalho é dividido em **4 fases incrementais** com checkpoints de validaçã
     ```
     *   Confirmar existência e reversibilidade do índice `idx_scrape_runs_server_latest` em `scrape_runs`.
 *   **Container Build, Isolation & VPS Integration Verification:**
-    *   Confirmar ausência de `streamlit`, `pandas` e `pyarrow` no `scraper-worker`:
+    *   Confirmar que `src/dashboard/app.py` não importa `pandas` e que `scraper-worker` executa sem importar `src.dashboard` ou `streamlit`:
         ```bash
-        docker compose run --rm --no-deps scraper-worker python -c "import importlib.util; assert all(importlib.util.find_spec(m) is None for m in ('streamlit', 'pandas', 'pyarrow'))"
+        docker compose run --rm --no-deps scraper-worker python -c "import sys, src.flows.orchestrator; assert all(m not in sys.modules for m in ('streamlit', 'altair', 'pandas', 'pyarrow'))"
         ```
     *   Confirmar status `healthy` do container `dashboard` (executando `curl -fsS http://127.0.0.1:8501/_stcore/health` dentro do container), ausência de publicação da porta `8501` em `0.0.0.0` e `prefect-server` restrito a `127.0.0.1:4200` (`docker compose ps`).
     *   Confirmar negação de `INSERT`/`UPDATE`/`DELETE` e os 4 limites de sessão (`SHOW default_transaction_read_only; SHOW statement_timeout; SHOW lock_timeout; SHOW work_mem;`) conectando como `sro_readonly`.

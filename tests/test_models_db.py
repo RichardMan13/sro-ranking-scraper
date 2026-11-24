@@ -697,13 +697,16 @@ def test_raw_job_ranking_item_validation() -> None:
             job_level=50,
         )
 
-    with pytest.raises(ValidationError):
-        RawJobRankingItem(
-            rank=1,
-            char_name="ShadowThief",
-            job_type="TRADER",
-            job_level="",
-        )
+    job_optional = RawJobRankingItem(
+        rank=2,
+        char_name="ShadowThief",
+        job_type="-",
+        job_level="",
+        job_points="1,250",
+    )
+    assert job_optional.job_type is None
+    assert job_optional.job_level is None
+    assert job_optional.job_points == 1250
 
 
 def test_raw_guild_ranking_item_validation() -> None:
@@ -840,14 +843,16 @@ def test_required_int_fields_normalize_thousands_and_reject_invalid_values() -> 
                 job_level=50,
             )
         with pytest.raises(ValidationError):
+            RawGuildRankingItem(rank=bad_required, guild_name="Olympus")
+
+    for bad_job_level in ("100.5", True, False):
+        with pytest.raises(ValidationError):
             RawJobRankingItem(
                 rank=1,
                 char_name="Shadow",
                 job_type="TRADER",
-                job_level=bad_required,
+                job_level=bad_job_level,
             )
-        with pytest.raises(ValidationError):
-            RawGuildRankingItem(rank=bad_required, guild_name="Olympus")
 
 
 def test_clean_float_numbers_multi_dot_thousands() -> None:
@@ -956,9 +961,9 @@ def test_orm_tables_constraints_and_postgres_ddl() -> None:
 def test_alembic_script_history() -> None:
     cfg = Config("alembic.ini")
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_heads() == ["002_analytical_views"]
+    assert script.get_heads() == ["003_dashboard_indexes"]
     revisions = [rev.revision for rev in script.walk_revisions()]
-    assert revisions == ["002_analytical_views", "001_initial_schema"]
+    assert revisions == ["003_dashboard_indexes", "002_analytical_views", "001_initial_schema"]
 
 
 def test_alembic_offline_upgrade_sql(monkeypatch: pytest.MonkeyPatch) -> None:
