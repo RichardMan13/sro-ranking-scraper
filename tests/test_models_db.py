@@ -76,6 +76,11 @@ def test_settings_defaults_and_env_overrides(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.delenv("QUARANTINE_DIR", raising=False)
     monkeypatch.delenv("QUARANTINE_RETENTION_DAYS", raising=False)
     monkeypatch.delenv("CIRCUIT_BREAKER_COOLDOWN_HOURS", raising=False)
+    monkeypatch.delenv("MAX_PAGES_PER_CATEGORY", raising=False)
+    monkeypatch.delenv("RSILKROAD_PAGE_SIZE", raising=False)
+    monkeypatch.delenv("RSILKROAD_INTER_BATCH_DELAY_MIN", raising=False)
+    monkeypatch.delenv("RSILKROAD_INTER_BATCH_DELAY_MAX", raising=False)
+    monkeypatch.delenv("RSILKROAD_CF_CLEARANCE", raising=False)
     monkeypatch.delenv("ELECTUS_CF_CLEARANCE", raising=False)
     monkeypatch.delenv("DISCORD_OPS_WEBHOOK_URL", raising=False)
     monkeypatch.delenv("DISCORD_COMMUNITY_WEBHOOK_URL", raising=False)
@@ -87,6 +92,11 @@ def test_settings_defaults_and_env_overrides(monkeypatch: pytest.MonkeyPatch) ->
     assert defaults.quarantine_dir == Path("./quarantine")
     assert defaults.quarantine_retention_days == 30
     assert defaults.circuit_breaker_cooldown_hours == 6
+    assert defaults.max_pages_per_category == 400
+    assert defaults.rsilkroad_page_size == 100
+    assert defaults.rsilkroad_inter_batch_delay_min == 0.35
+    assert defaults.rsilkroad_inter_batch_delay_max == 0.75
+    assert defaults.rsilkroad_cf_clearance is None
     assert defaults.electus_cf_clearance is None
     assert defaults.discord_ops_webhook_url is None
     assert defaults.discord_community_webhook_url is None
@@ -96,6 +106,10 @@ def test_settings_defaults_and_env_overrides(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("QUARANTINE_DIR", "/tmp/quarantine")
     monkeypatch.setenv("QUARANTINE_RETENTION_DAYS", "14")
     monkeypatch.setenv("CIRCUIT_BREAKER_COOLDOWN_HOURS", "12")
+    monkeypatch.setenv("RSILKROAD_PAGE_SIZE", "50")
+    monkeypatch.setenv("RSILKROAD_INTER_BATCH_DELAY_MIN", "1.0")
+    monkeypatch.setenv("RSILKROAD_INTER_BATCH_DELAY_MAX", "2.5")
+    monkeypatch.setenv("RSILKROAD_CF_CLEARANCE", "  rsro-cf-token-123  ")
     monkeypatch.setenv("ELECTUS_CF_CLEARANCE", "cf-token-xyz")
 
     overridden = get_settings()
@@ -104,6 +118,11 @@ def test_settings_defaults_and_env_overrides(monkeypatch: pytest.MonkeyPatch) ->
     assert overridden.quarantine_dir == Path("/tmp/quarantine")
     assert overridden.quarantine_retention_days == 14
     assert overridden.circuit_breaker_cooldown_hours == 12
+    assert overridden.rsilkroad_page_size == 50
+    assert overridden.rsilkroad_inter_batch_delay_min == 1.0
+    assert overridden.rsilkroad_inter_batch_delay_max == 2.5
+    assert isinstance(overridden.rsilkroad_cf_clearance, SecretStr)
+    assert overridden.rsilkroad_cf_clearance.get_secret_value() == "rsro-cf-token-123"
     assert overridden.electus_cf_clearance == "cf-token-xyz"
 
 
@@ -113,6 +132,76 @@ def test_settings_rejects_invalid_numeric_bounds(monkeypatch: pytest.MonkeyPatch
         Settings(_env_file=None, quarantine_retention_days=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, circuit_breaker_cooldown_hours=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rsilkroad_page_size=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rsilkroad_page_size=101)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rsilkroad_inter_batch_delay_min=-0.1)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rsilkroad_inter_batch_delay_max=-0.1)
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            rsilkroad_inter_batch_delay_min=1.5,
+            rsilkroad_inter_batch_delay_max=0.5,
+        )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rsilkroad_inter_batch_delay_min=float("nan"))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rsilkroad_inter_batch_delay_max=float("inf"))
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("", None),
+        ("   ", None),
+        (" \t", None),
+        (SecretStr(" \t "), None),
+        ("  rsro-token-abc  ", "rsro-token-abc"),
+        (SecretStr("  rsro-token-xyz  "), "rsro-token-xyz"),
+    ],
+)
+def test_settings_normalizes_rsilkroad_cf_clearance(
+    raw_value: str | SecretStr,
+    expected: str | None,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://user:pass@localhost:5432/sro",
+        rsilkroad_cf_clearance=raw_value,
+    )
+    if expected is None:
+        assert settings.rsilkroad_cf_clearance is None
+    else:
+        assert isinstance(settings.rsilkroad_cf_clearance, SecretStr)
+        assert settings.rsilkroad_cf_clearance.get_secret_value() == expected
+
+
+@pytest.mark.parametrize(
+    "bad_token",
+    [
+        "\r\n",
+        "\nsecret_cf_do_not_leak",
+        "secret_cf_do_not_leak\r",
+        "secret_cf_do_not_leak\r\nX-Injected: 1",
+        "secret_cf_do_not_leak; evil=1",
+        ";secret_cf_do_not_leak",
+        SecretStr("\nsecret_cf_do_not_leak"),
+        SecretStr("secret_cf_do_not_leak;evil=1"),
+    ],
+)
+def test_settings_rejects_unsafe_rsilkroad_cf_clearance_without_leaking_secret(
+    bad_token: str | SecretStr,
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            _env_file=None,
+            database_url="postgresql+asyncpg://user:pass@localhost:5432/sro",
+            rsilkroad_cf_clearance=bad_token,
+        )
+    assert "secret_cf_do_not_leak" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

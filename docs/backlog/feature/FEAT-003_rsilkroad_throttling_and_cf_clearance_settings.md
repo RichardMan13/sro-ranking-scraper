@@ -1,6 +1,6 @@
 # FEAT-003: Configurar throttling, `page_size` e `cf_clearance` do `RSilkroadScraper` via `Settings`
 
-- **Status:** Pending
+- **Status:** Done
 - **Prioridade:** Média
 - **Componente:** scraper
 - **Design Relacionado:** [001_sro_ranking_scraper_pipeline.md](../../designs/001_sro_ranking_scraper_pipeline.md)

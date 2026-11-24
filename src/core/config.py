@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Self
 from urllib.parse import urlsplit
 
-from pydantic import Field, PostgresDsn, SecretStr, field_validator
+from pydantic import Field, PostgresDsn, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ALLOWED_DB_SCHEME_RE = re.compile(
@@ -38,9 +38,39 @@ class Settings(BaseSettings):
     quarantine_retention_days: int = Field(default=30, ge=1)
     circuit_breaker_cooldown_hours: int = Field(default=6, ge=1)
     max_pages_per_category: int = Field(default=400, ge=1)
+    rsilkroad_page_size: int = Field(default=100, ge=1, le=100)
+    rsilkroad_inter_batch_delay_min: float = Field(default=0.35, ge=0.0, allow_inf_nan=False)
+    rsilkroad_inter_batch_delay_max: float = Field(default=0.75, ge=0.0, allow_inf_nan=False)
+    rsilkroad_cf_clearance: SecretStr | None = None
     electus_cf_clearance: str | None = None
     discord_ops_webhook_url: SecretStr | None = None
     discord_community_webhook_url: SecretStr | None = None
+
+    @field_validator("rsilkroad_cf_clearance", mode="before")
+    @classmethod
+    def normalize_and_validate_rsilkroad_cf_clearance(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, SecretStr):
+            raw = value.get_secret_value()
+            if any(ch in raw for ch in ("\r", "\n", ";")):
+                raise ValueError("Invalid RSILKROAD_CF_CLEARANCE: must not contain CR, LF, or ';'")
+            stripped = raw.strip()
+            return SecretStr(stripped) if stripped else None
+        if isinstance(value, str):
+            if any(ch in value for ch in ("\r", "\n", ";")):
+                raise ValueError("Invalid RSILKROAD_CF_CLEARANCE: must not contain CR, LF, or ';'")
+            stripped = value.strip()
+            return stripped if stripped else None
+        return value
+
+    @model_validator(mode="after")
+    def validate_rsilkroad_delay_range(self) -> Self:
+        if self.rsilkroad_inter_batch_delay_min > self.rsilkroad_inter_batch_delay_max:
+            raise ValueError(
+                "RSILKROAD_INTER_BATCH_DELAY_MIN must be <= RSILKROAD_INTER_BATCH_DELAY_MAX"
+            )
+        return self
 
     @field_validator(
         "discord_ops_webhook_url",

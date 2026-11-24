@@ -29,6 +29,7 @@ Este arquivo define as regras obrigatórias para qualquer agente de execução (
 - **PROIBIDO usar infraestrutura pesada ou bypasses pagos:** Nunca introduza Apache Airflow, Apache Spark, serviços comerciais de resolução de CAPTCHA ou pools de proxies pagos.
 - **PROIBIDO gravar HTML bruto no PostgreSQL:** Payloads inválidos ou bloqueados nunca devem ir para colunas `TEXT`/`BYTEA`; use exclusivamente a quarentena local em disco.
 - **PROIBIDO secrets hardcoded:** Todas as credenciais e tokens (`DATABASE_URL`, `PREFECT_API_URL`, `cf_clearance`, etc.) devem vir de variáveis de ambiente (`.env` / `pydantic-settings`).
+- **PROIBIDO commitar sem permissão explícita:** Nunca execute `git commit` (nem `git commit --amend`, `git push` ou operações equivalentes que criem/alterem commits) sem autorização explícita do usuário na conversa atual.
 
 ### Padrões de Dados, Resiliência & Recursos
 - **Append-Only & Auditoria:** Tabelas de fatos (`character_snapshots`, `guild_snapshots`) são estritamente aditivas, particionadas por `RANGE (created_at)` com chave primária composta `PRIMARY KEY (id, created_at)` e colunas `created_at` / `updated_at`. 100% das execuções devem ser registradas em `scrape_runs`.

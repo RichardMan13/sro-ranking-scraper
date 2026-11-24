@@ -2252,3 +2252,134 @@ def test_rsilkroad_inter_batch_delay_jitter_applied_between_batches(
     # Pages 2..4 in batch 1 -> 1 inter-batch sleep -> page 5 in batch 2
     assert len(sleep_calls) == 1
     assert 0.25 <= sleep_calls[0] <= 0.50
+
+
+def test_feat003_rsilkroad_settings_defaults_overrides_and_init_validation(
+    tmp_path: Path,
+) -> None:
+    default_settings = _make_settings(tmp_path)
+    default_scraper = RSilkroadScraper(default_settings)
+    assert default_scraper._page_size == 100
+    assert default_scraper._inter_batch_delay_range == (0.35, 0.75)
+    assert default_scraper._cf_cookies() is None
+
+    custom_settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://user:pass@localhost:5432/sro_test",
+        quarantine_dir=tmp_path / "quarantine",
+        rsilkroad_page_size=25,
+        rsilkroad_inter_batch_delay_min=0.5,
+        rsilkroad_inter_batch_delay_max=1.25,
+        rsilkroad_cf_clearance="rsro-secret-cookie",
+    )
+    from_settings = RSilkroadScraper(custom_settings)
+    assert from_settings._page_size == 25
+    assert from_settings._inter_batch_delay_range == (0.5, 1.25)
+    assert from_settings._cf_cookies() == {"cf_clearance": "rsro-secret-cookie"}
+
+    overridden = RSilkroadScraper(
+        custom_settings,
+        page_size=50,
+        inter_batch_delay_range=(0.1, 0.2),
+    )
+    assert overridden._page_size == 50
+    assert overridden._inter_batch_delay_range == (0.1, 0.2)
+
+    for bad_page_size in (0, -1, 101):
+        with pytest.raises(ValueError, match="page_size"):
+            RSilkroadScraper(default_settings, page_size=bad_page_size)
+
+    for bad_delay_range in (
+        (-0.1, 0.5),
+        (1.0, 0.5),
+        (float("nan"), 1.0),
+        (0.0, float("inf")),
+        (float("-inf"), 0.5),
+    ):
+        with pytest.raises(ValueError, match="inter_batch_delay_range"):
+            RSilkroadScraper(default_settings, inter_batch_delay_range=bad_delay_range)
+
+
+def test_feat003_rsilkroad_propagates_configured_page_size_in_query_string(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://user:pass@localhost:5432/sro_test",
+        quarantine_dir=tmp_path / "quarantine",
+        rsilkroad_page_size=40,
+        rsilkroad_inter_batch_delay_min=0.0,
+        rsilkroad_inter_batch_delay_max=0.0,
+    )
+    scraper = RSilkroadScraper(settings, retry_delays=(0.0, 0.0))
+    base_url = "https://www.rsilkroad.com"
+    requested_urls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(200, content=b'<table class="table"><tbody></tbody></table>')
+
+    async def execute() -> None:
+        client = httpx.AsyncClient(http2=True, transport=httpx.MockTransport(handler))
+        async with client:
+            await scraper.fetch_player_pages(client, base_url)
+            await scraper.fetch_guild_pages(client, base_url)
+
+    _run_async(execute())
+
+    assert requested_urls == [
+        f"{base_url}/Rank/Player?page=1&pageSize=40",
+        f"{base_url}/Rank/Guild?page=1&pageSize=40",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("cf_token", "expected_present"),
+    [
+        ("rsro-cf-abc-123", True),
+        (None, False),
+        (" \t", False),
+    ],
+)
+def test_feat003_rsilkroad_cf_clearance_cookie_injection_and_no_log_leak(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    cf_token: str | None,
+    expected_present: bool,
+) -> None:
+    from src.core.logging import clear_run_context, configure_logging
+
+    configure_logging("DEBUG")
+    clear_run_context()
+
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://user:pass@localhost:5432/sro_test",
+        quarantine_dir=tmp_path / "quarantine",
+        rsilkroad_cf_clearance=cf_token,
+    )
+    scraper = RSilkroadScraper(settings, retry_delays=(0.0, 0.0))
+    captured_cookies: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_cookies.append(request.headers.get("cookie"))
+        return httpx.Response(200, content=b'<table class="table"><tbody></tbody></table>')
+
+    async def execute() -> CategoryFetchResult:
+        client = httpx.AsyncClient(http2=True, transport=httpx.MockTransport(handler))
+        async with client:
+            return await scraper.fetch_player_pages(client, "https://www.rsilkroad.com")
+
+    _run_async(execute())
+
+    assert len(captured_cookies) == 1
+    cookie_header = captured_cookies[0]
+    if expected_present:
+        assert cookie_header is not None
+        assert "cf_clearance=rsro-cf-abc-123" in cookie_header
+    else:
+        assert cookie_header is None or "cf_clearance=" not in cookie_header
+
+    captured_logs = capsys.readouterr()
+    assert "rsro-cf-abc-123" not in captured_logs.out
+    assert "rsro-cf-abc-123" not in captured_logs.err

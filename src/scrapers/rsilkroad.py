@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -147,8 +148,8 @@ class RSilkroadScraper(BaseRankingScraper):
         retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS,
         timeout_budget_seconds: float = DEFAULT_TIMEOUT_BUDGET_SECONDS,
         max_pages_per_category: int | None = None,
-        page_size: int = _RSILKROAD_PAGE_SIZE,
-        inter_batch_delay_range: tuple[float, float] = DEFAULT_INTER_BATCH_DELAY_RANGE,
+        page_size: int | None = None,
+        inter_batch_delay_range: tuple[float, float] | None = None,
     ) -> None:
         super().__init__(
             settings=settings,
@@ -162,14 +163,43 @@ class RSilkroadScraper(BaseRankingScraper):
         )
         if resolved_max_pages < 1:
             raise ValueError("max_pages_per_category must be >= 1")
-        if page_size < 1:
-            raise ValueError("page_size must be >= 1")
-        min_delay, max_delay = inter_batch_delay_range
-        if min_delay < 0 or max_delay < min_delay:
-            raise ValueError("inter_batch_delay_range must satisfy 0 <= min_delay <= max_delay")
+
+        resolved_page_size = (
+            page_size if page_size is not None else self.settings.rsilkroad_page_size
+        )
+        if resolved_page_size < 1 or resolved_page_size > 100:
+            raise ValueError("page_size must be between 1 and 100")
+
+        resolved_delay_range = (
+            inter_batch_delay_range
+            if inter_batch_delay_range is not None
+            else (
+                self.settings.rsilkroad_inter_batch_delay_min,
+                self.settings.rsilkroad_inter_batch_delay_max,
+            )
+        )
+        min_delay, max_delay = resolved_delay_range
+        if (
+            not math.isfinite(min_delay)
+            or not math.isfinite(max_delay)
+            or min_delay < 0
+            or max_delay < min_delay
+        ):
+            raise ValueError(
+                "inter_batch_delay_range must contain finite values "
+                "satisfying 0 <= min_delay <= max_delay"
+            )
+
         self._max_pages_per_category: int = resolved_max_pages
-        self._page_size: int = page_size
+        self._page_size: int = resolved_page_size
         self._inter_batch_delay_range: tuple[float, float] = (min_delay, max_delay)
+
+    def _cf_cookies(self) -> dict[str, str] | None:
+        secret = self.settings.rsilkroad_cf_clearance
+        if secret is None:
+            return None
+        token = secret.get_secret_value().strip()
+        return {"cf_clearance": token} if token else None
 
     async def _sleep_between_batches(self) -> None:
         min_delay, max_delay = self._inter_batch_delay_range
@@ -191,7 +221,12 @@ class RSilkroadScraper(BaseRankingScraper):
     ) -> _FetchedPage:
         url = f"{clean_base}{route_path}?page={page}&pageSize={self._page_size}"
         try:
-            response = await self._fetch_url(client, url, category=category)
+            response = await self._fetch_url(
+                client,
+                url,
+                cookies=self._cf_cookies(),
+                category=category,
+            )
         except TransportFetchError as exc:
             if page > 1 and exc.status_code == 404:
                 return _FetchedPage(
@@ -425,7 +460,7 @@ class RSilkroadScraper(BaseRankingScraper):
         client: httpx.AsyncClient,
         base_url: str,
     ) -> CategoryFetchResult:
-        """Fetch and parse all RSilkroad player ranking pages (`pageSize=100`)."""
+        """Fetch and parse all RSilkroad player ranking pages using configured `pageSize`."""
         return await self._fetch_paginated_html(
             client,
             base_url,
@@ -447,7 +482,7 @@ class RSilkroadScraper(BaseRankingScraper):
         client: httpx.AsyncClient,
         base_url: str,
     ) -> CategoryFetchResult:
-        """Fetch and parse all RSilkroad guild ranking pages (`pageSize=100`)."""
+        """Fetch and parse all RSilkroad guild ranking pages using configured `pageSize`."""
         return await self._fetch_paginated_html(
             client,
             base_url,

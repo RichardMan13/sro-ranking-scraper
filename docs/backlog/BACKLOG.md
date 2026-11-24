@@ -107,7 +107,7 @@ Por que esta pequena melhoria é necessária?
 
 | ID | Arquivo | Componente | Prioridade | Status | Resumo |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| FEAT-003 | [FEAT-003_rsilkroad_throttling_and_cf_clearance_settings.md](feature/FEAT-003_rsilkroad_throttling_and_cf_clearance_settings.md) | scraper | Média | Pending | Expor `page_size`, `inter_batch_delay` e `RSILKROAD_CF_CLEARANCE` do `RSilkroadScraper` via `Settings`/`.env` para mitigação de `HTTP 429` sem rebuild |
+| — | *Nenhuma melhoria pendente registrada ainda* | — | — | — | — |
 
 ---
 
@@ -131,3 +131,4 @@ Por que esta pequena melhoria é necessária?
 | FIX-003 | fix | [FIX-003_chronicle_ranking_routes_and_layout.md](fix/FIX-003_chronicle_ranking_routes_and_layout.md) | 2026-11-23 | Done | `src/scrapers/chronicle.py`, `src/models/pydantic_schemas.py`, `src/scrapers/base.py` |
 | FEAT-001 | feature | [FEAT-001_chronicle_full_pagination_and_job_filters.md](feature/FEAT-001_chronicle_full_pagination_and_job_filters.md) | 2026-11-24 | Done | `src/scrapers/chronicle.py`, `tests/test_parsers.py`, `tests/fixtures/chronicle_*` |
 | FEAT-002 | feature | [FEAT-002_rsilkroad_full_pagination_scraper.md](feature/FEAT-002_rsilkroad_full_pagination_scraper.md) | 2026-11-24 | Done | `src/scrapers/rsilkroad.py`, `src/scrapers/__init__.py`, `src/flows/orchestrator.py`, `alembic/versions/004_seed_rsilkroad.py` |
+| FEAT-003 | feature | [FEAT-003_rsilkroad_throttling_and_cf_clearance_settings.md](feature/FEAT-003_rsilkroad_throttling_and_cf_clearance_settings.md) | 2026-11-24 | Done | `src/core/config.py`, `src/scrapers/rsilkroad.py`, `.env.example`, `docker-compose.yml`, `tests/test_models_db.py`, `tests/test_parsers.py` |
