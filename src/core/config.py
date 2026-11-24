@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     quarantine_dir: Path = Path("./quarantine")
     quarantine_retention_days: int = Field(default=30, ge=1)
     circuit_breaker_cooldown_hours: int = Field(default=6, ge=1)
+    max_pages_per_category: int = Field(default=400, ge=1)
     electus_cf_clearance: str | None = None
     discord_ops_webhook_url: SecretStr | None = None
     discord_community_webhook_url: SecretStr | None = None

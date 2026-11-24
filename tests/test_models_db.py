@@ -961,9 +961,14 @@ def test_orm_tables_constraints_and_postgres_ddl() -> None:
 def test_alembic_script_history() -> None:
     cfg = Config("alembic.ini")
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_heads() == ["003_dashboard_indexes"]
+    assert script.get_heads() == ["004_seed_rsilkroad"]
     revisions = [rev.revision for rev in script.walk_revisions()]
-    assert revisions == ["003_dashboard_indexes", "002_analytical_views", "001_initial_schema"]
+    assert revisions == [
+        "004_seed_rsilkroad",
+        "003_dashboard_indexes",
+        "002_analytical_views",
+        "001_initial_schema",
+    ]
 
 
 def test_alembic_offline_upgrade_sql(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -985,7 +990,7 @@ def test_alembic_offline_upgrade_sql(monkeypatch: pytest.MonkeyPatch) -> None:
     ):
         assert f"CREATE TABLE {table_name}" in sql_no_env
 
-    for seed_id in ("'chronicle'", "'electus'", "'play_golden'"):
+    for seed_id in ("'chronicle'", "'electus'", "'play_golden'", "'rsilkroad'"):
         assert seed_id in sql_no_env
     assert "ON CONFLICT (id) DO NOTHING" in sql_no_env
 

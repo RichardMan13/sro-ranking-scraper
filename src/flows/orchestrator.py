@@ -46,7 +46,7 @@ from src.flows.tasks import (  # noqa: E402
 from src.models.db_models import Server  # noqa: E402
 from src.scrapers.base import ScrapeRunSummary  # noqa: E402
 
-VALID_MANUAL_TARGETS: tuple[str, ...] = ("all", "chronicle", "electus", "play_golden")
+VALID_MANUAL_TARGETS: tuple[str, ...] = ("all", "chronicle", "electus", "play_golden", "rsilkroad")
 
 
 def compute_post_fw_cron(fw_day_of_week: int, fw_end_time_utc: time) -> str:

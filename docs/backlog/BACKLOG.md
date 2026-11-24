@@ -107,8 +107,7 @@ Por que esta pequena melhoria é necessária?
 
 | ID | Arquivo | Componente | Prioridade | Status | Resumo |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| FEAT-001 | [FEAT-001_chronicle_full_pagination_and_job_filters.md](feature/FEAT-001_chronicle_full_pagination_and_job_filters.md) | scraper | Alta | Pending | Extrair todas as páginas de `play-chronicle.com` com filtros `top-player`, `top-guild`, `top-trader`, `top-hunter` e `top-thieves` |
-| FEAT-002 | [FEAT-002_rsilkroad_full_pagination_scraper.md](feature/FEAT-002_rsilkroad_full_pagination_scraper.md) | scraper | Alta | Pending | Adicionar extração completa de todas as páginas de `rsilkroad.com` (`/Rank/Player` e `/Rank/Guild` com `pageSize=100`) |
+| — | *Nenhuma melhoria pendente registrada* | — | — | — | — |
 
 ---
 
@@ -119,3 +118,5 @@ Por que esta pequena melhoria é necessária?
 | FIX-001 | fix | [FIX-001_hyperfilter_js_challenge_detection.md](fix/FIX-001_hyperfilter_js_challenge_detection.md) | 2026-11-23 | Done | `src/scrapers/base.py`, `tests/fixtures/electus_hyperfilter_200.html` |
 | FIX-002 | fix | [FIX-002_diamwall_513_challenge_detection.md](fix/FIX-002_diamwall_513_challenge_detection.md) | 2026-11-23 | Done | `src/scrapers/base.py`, `tests/fixtures/golden_diamwall_513.html` |
 | FIX-003 | fix | [FIX-003_chronicle_ranking_routes_and_layout.md](fix/FIX-003_chronicle_ranking_routes_and_layout.md) | 2026-11-23 | Done | `src/scrapers/chronicle.py`, `src/models/pydantic_schemas.py`, `src/scrapers/base.py` |
+| FEAT-001 | feature | [FEAT-001_chronicle_full_pagination_and_job_filters.md](feature/FEAT-001_chronicle_full_pagination_and_job_filters.md) | 2026-11-24 | Done | `src/scrapers/chronicle.py`, `tests/test_parsers.py`, `tests/fixtures/chronicle_*` |
+| FEAT-002 | feature | [FEAT-002_rsilkroad_full_pagination_scraper.md](feature/FEAT-002_rsilkroad_full_pagination_scraper.md) | 2026-11-24 | Done | `src/scrapers/rsilkroad.py`, `src/scrapers/__init__.py`, `src/flows/orchestrator.py`, `alembic/versions/004_seed_rsilkroad.py` |

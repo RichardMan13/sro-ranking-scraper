@@ -1,6 +1,6 @@
 # FEAT-001: Extrair todas as páginas e filtros de job (`trader`, `hunter`, `thieves`) no `ChronicleScraper`
 
-- **Status:** Pending
+- **Status:** Done
 - **Prioridade:** Alta
 - **Componente:** scraper
 - **Design Relacionado:** [001_sro_ranking_scraper_pipeline.md](../../designs/001_sro_ranking_scraper_pipeline.md)
@@ -20,11 +20,18 @@ Extrair **todas as páginas** disponíveis de `https://play-chronicle.com/rankin
   - Solicitar `page > last_page` **não** retorna tabela vazia nem HTTP `404` — o servidor repete a última página (ex.: `top-guild-5.html` devolve a página 3 com 14 linhas; `top-player-100.html` devolve a página 86 com `rank=2126`).
   - O HTML de cada página inclui chamadas `paginatorAjax('#result','/ranking/...-{next}.html')` com o botão `>>` apontando para a próxima página (ou ausente na última página).
 
-## Escopo Proposto
-- Atualizar `ChronicleScraper.fetch_job_pages` (`src/scrapers/chronicle.py`) para consultar os 3 filtros reais (`/ranking/job/top-trader-{page}.html`, `/ranking/job/top-hunter-{page}.html`, `/ranking/job/top-thieves-{page}.html`), atribuindo `job_type` (`TRADER` / `HUNTER` / `THIEF`), `job_level` (col 3) e `job_exp` (col 4).
-- Remover os limites rígidos (`_PLAYER_MAX_PAGES=10`, `_JOB_MAX_PAGES=5`, `_GUILD_MAX_PAGES=2`) e implementar paginação completa orientada pelo paginador (`paginatorAjax` / link `>>`) + guarda anti-loop contra clamping (parar se não houver próxima página no paginador ou se os registros da página repetirem a página anterior, com teto de segurança configurável).
-- Avaliar paralelização das páginas respeitando `asyncio.Semaphore(3)` para manter a coleta completa (~100 páginas) dentro do budget de 180s.
-- Adicionar fixtures estáticas e testes unitários de regressão em `tests/` (incluindo cenário de clamping na última página e os 3 filtros de job).
+## Escopo Implementado
+- Atualizado `ChronicleScraper.fetch_job_pages` ([src/scrapers/chronicle.py](../../../src/scrapers/chronicle.py)) para consultar em paralelo (via `asyncio.TaskGroup`) os 3 filtros reais (`/ranking/job/top-trader-{page}.html`, `/ranking/job/top-hunter-{page}.html`, `/ranking/job/top-thieves-{page}.html`), atribuindo `job_type` (`TRADER` / `HUNTER` / `THIEF`), `job_level` (col 3) e `job_exp` (col 4).
+- Removidos os limites rígidos (`_PLAYER_MAX_PAGES=10`, `_JOB_MAX_PAGES=5`, `_GUILD_MAX_PAGES=2`) e implementada paginação completa em `_fetch_paginated_html()`:
+  - **Orientada pelo paginador (`_extract_paginator_info`):** extrai todos os sufixos `-{N}.html` de chamadas `paginatorAjax(...)` no HTML e avança em lotes concorrentes (até `DEFAULT_MAX_CONCURRENT_REQUESTS = 3`, sob `asyncio.Semaphore(3)`) enquanto `max(page_numbers) > current_page`.
+  - **Guardas anti-loop e fallback:** interrompe se uma página repetir o fingerprint da página anterior (clamping), retornar tabela vazia ou `HTTP 404` em `page > 1`; quando o HTML não contém chamadas `paginatorAjax`, executa fallback sequencial com as mesmas guardas.
+  - **Teto de segurança:** configurável via `MAX_PAGES_PER_CATEGORY` em [src/core/config.py](../../../src/core/config.py) (`Settings.max_pages_per_category`, padrão `400`) e sobrescrevível via `ChronicleScraper.__init__(max_pages_per_category=...)`.
+  - **Helpers HTML compartilhados:** extraídos para [src/scrapers/_html_utils.py](../../../src/scrapers/_html_utils.py).
+- Adicionadas fixtures estáticas e testes unitários de regressão em [tests/test_parsers.py](../../../tests/test_parsers.py) (incluindo janela deslizante, clamping na última página e reconciliação dos 3 filtros de job):
+  - [tests/fixtures/chronicle_trader_page1.html](../../../tests/fixtures/chronicle_trader_page1.html)
+  - [tests/fixtures/chronicle_trader_page2.html](../../../tests/fixtures/chronicle_trader_page2.html)
+  - [tests/fixtures/chronicle_hunter_page1.html](../../../tests/fixtures/chronicle_hunter_page1.html)
+  - [tests/fixtures/chronicle_thieves_page1.html](../../../tests/fixtures/chronicle_thieves_page1.html)
 
 ## Critérios de Aceite
 - `ChronicleScraper` coleta todas as páginas de `top-player`, `top-guild`, `top-trader`, `top-hunter` e `top-thieves` sem entrar em loop infinito quando o site clampa `page > last_page`.

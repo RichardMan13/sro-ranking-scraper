@@ -7,12 +7,14 @@ from src.scrapers.base import BaseRankingScraper
 from src.scrapers.chronicle import ChronicleScraper
 from src.scrapers.electus import ElectusScraper
 from src.scrapers.golden import PlayGoldenScraper
+from src.scrapers.rsilkroad import RSilkroadScraper
 
 __all__ = [
     "BaseRankingScraper",
     "ChronicleScraper",
     "ElectusScraper",
     "PlayGoldenScraper",
+    "RSilkroadScraper",
     "get_scraper",
 ]
 
@@ -20,6 +22,7 @@ _SCRAPER_REGISTRY: Final[dict[str, type[BaseRankingScraper]]] = {
     "chronicle": ChronicleScraper,
     "electus": ElectusScraper,
     "play_golden": PlayGoldenScraper,
+    "rsilkroad": RSilkroadScraper,
 }
 
 

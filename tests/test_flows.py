@@ -759,7 +759,8 @@ def test_cli_main_serve_and_manual_and_invalid_args(
     }
 
     assert orchestrator.main(["--mode", "manual", "--target", "chronicle"]) == 0
-    assert manual_targets == ["chronicle"]
+    assert orchestrator.main(["--mode", "manual", "--target", "rsilkroad"]) == 0
+    assert manual_targets == ["chronicle", "rsilkroad"]
 
     with pytest.raises(SystemExit) as exc_mode:
         orchestrator.main(["--mode", "invalid_mode"])

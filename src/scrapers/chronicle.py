@@ -1,91 +1,96 @@
 from __future__ import annotations
 
-import math
+import asyncio
 import re
 from collections.abc import Callable
-from pathlib import Path
-from typing import Any, Final
-from urllib.parse import urlsplit
+from dataclasses import dataclass
+from typing import Any, Final, Literal
 
 import httpx
 from lxml import etree
-from lxml import html as lxml_html
 
+from src.core.config import Settings
 from src.models.pydantic_schemas import _EMPTY_PLACEHOLDERS
+from src.scrapers._html_utils import (
+    cell_text as _cell_text,
+)
+from src.scrapers._html_utils import (
+    decode_html_bytes as _decode_html_bytes,
+)
+from src.scrapers._html_utils import (
+    extract_char_name as _extract_char_name,
+)
+from src.scrapers._html_utils import (
+    extract_race_from_cell as _extract_race_from_cell,
+)
+from src.scrapers._html_utils import (
+    extract_table_rows as _extract_tree_rows,
+)
+from src.scrapers._html_utils import (
+    is_empty_notice_row as _is_empty_notice_row,
+)
+from src.scrapers._html_utils import (
+    parse_html_tree as _parse_html_tree,
+)
+from src.scrapers._html_utils import (
+    parse_optional_numeric as _parse_optional_numeric,
+)
+from src.scrapers._html_utils import (
+    strip_rank_prefix as _strip_rank_prefix,
+)
+from src.scrapers._html_utils import (
+    xpath_elements as _xpath_elements,
+)
 from src.scrapers.base import (
+    DEFAULT_MAX_CONCURRENT_REQUESTS,
+    DEFAULT_RETRY_DELAYS,
+    DEFAULT_TIMEOUT_BUDGET_SECONDS,
     BaseRankingScraper,
+    BlockedChallengeError,
     CategoryFetchResult,
     PagePayload,
+    TargetMaintenanceError,
     TransportFetchError,
+    _flatten_exceptions,
 )
 
-_PLAYER_MAX_PAGES: Final[int] = 10
-_JOB_MAX_PAGES: Final[int] = 5
-_GUILD_MAX_PAGES: Final[int] = 2
+_DEFAULT_MAX_PAGES_SAFETY_CAP: Final[int] = 400
 _CHRONICLE_TABLE_CLASSES: Final[tuple[str, ...]] = ("table", "table-striped", "table-hover")
 
-_EMPTY_NOTICE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:"
-    r"\bno\s+(?:records?|results?|data|entries|rows|items|matches|players?|guilds?|jobs?|characters?)\b"
-    r"|\b0\s+(?:records?|results?|data|entries|rows|items|matches|players?|guilds?|jobs?|characters?)\b"
-    r"|\bshowing\s+0\b"
-    r"|\btotal\s*[:=]?\s*0\b"
-    r"|\b(?:empty|nothing\s+found)\b"
-    r")",
+_CHRONICLE_JOB_ROUTES: Final[tuple[tuple[Literal["TRADER", "HUNTER", "THIEF"], str], ...]] = (
+    ("TRADER", "/ranking/job/top-trader-{page}.html"),
+    ("HUNTER", "/ranking/job/top-hunter-{page}.html"),
+    ("THIEF", "/ranking/job/top-thieves-{page}.html"),
+)
+
+_PAGINATOR_AJAX_RE: Final[re.Pattern[str]] = re.compile(
+    r"paginatorAjax\s*\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)",
     re.IGNORECASE,
+)
+_PAGE_NUMBER_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"-(\d+)\.html(?:[?#].*)?$", re.IGNORECASE
 )
 
 
-def _decode_html_bytes(content: bytes, encoding: str | None) -> str:
-    chosen = (encoding or "").strip() or "utf-8"
-    try:
-        return content.decode(chosen, errors="replace")
-    except LookupError:
-        return content.decode("utf-8", errors="replace")
+@dataclass(frozen=True, slots=True)
+class _PaginatorInfo:
+    """Pagination hints extracted from Chronicle `paginatorAjax` calls."""
+
+    has_paginator: bool
+    max_page: int | None
+    has_next: bool
 
 
-def _xpath_elements(node: etree._Element, expr: str) -> list[etree._Element]:
-    raw = node.xpath(expr)
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, etree._Element)]
+@dataclass(frozen=True, slots=True)
+class _FetchedPage:
+    """Parsed single-page outcome used for ordered batch processing."""
 
-
-def _element_text(element: etree._Element) -> str:
-    parts: list[str] = []
-    try:
-        for chunk in element.itertext():
-            if isinstance(chunk, bytes):
-                parts.append(chunk.decode("utf-8", errors="replace"))
-            else:
-                parts.append(chunk)
-    except UnicodeDecodeError:
-        raw_html = etree.tostring(element, encoding="utf-8", method="html")
-        decoded = raw_html.decode("utf-8", errors="replace")
-        fallback_tree = lxml_html.fromstring(
-            decoded.encode("utf-8"),
-            parser=lxml_html.HTMLParser(encoding="utf-8"),
-        )
-        parts = [
-            chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
-            for chunk in fallback_tree.itertext()
-        ]
-    return " ".join("".join(parts).split())
-
-
-def _cell_text(cells: list[etree._Element], index: int) -> str | None:
-    if index >= len(cells):
-        return None
-    return _element_text(cells[index])
-
-
-def _strip_rank_prefix(raw_rank: str | None) -> str | None:
-    if raw_rank is None:
-        return None
-    cleaned = raw_rank.strip()
-    if cleaned.startswith("#"):
-        return cleaned.lstrip("#").strip()
-    return cleaned
+    page: int
+    status_code: int | None
+    payload: PagePayload | None
+    records: list[dict[str, Any]]
+    paginator: _PaginatorInfo
+    not_found: bool = False
 
 
 def _extract_table_rows(
@@ -93,80 +98,44 @@ def _extract_table_rows(
     table_classes: tuple[str, ...],
     encoding: str | None,
 ) -> list[etree._Element]:
+    tree = _parse_html_tree(content, encoding)
+    return _extract_tree_rows(tree, table_classes)
+
+
+def _extract_paginator_info(
+    content: bytes,
+    encoding: str | None,
+    *,
+    current_page: int,
+) -> _PaginatorInfo:
     if not content.strip():
-        return []
+        return _PaginatorInfo(has_paginator=False, max_page=None, has_next=False)
     decoded = _decode_html_bytes(content, encoding)
-    if not decoded.strip():
-        return []
-    try:
-        tree = lxml_html.fromstring(
-            decoded.encode("utf-8"),
-            parser=lxml_html.HTMLParser(encoding="utf-8"),
-        )
-    except etree.ParserError:
-        return []
+    matches = _PAGINATOR_AJAX_RE.findall(decoded)
+    if not matches:
+        return _PaginatorInfo(has_paginator=False, max_page=None, has_next=False)
 
-    class_predicates = " and ".join(
-        f"contains(concat(' ', normalize-space(@class), ' '), ' {cls} ')" for cls in table_classes
+    page_numbers: list[int] = []
+    for target_url in matches:
+        page_match = _PAGE_NUMBER_SUFFIX_RE.search(target_url.strip())
+        if page_match is not None:
+            page_numbers.append(int(page_match.group(1)))
+
+    if not page_numbers:
+        return _PaginatorInfo(has_paginator=True, max_page=None, has_next=False)
+
+    max_page = max(page_numbers)
+    return _PaginatorInfo(
+        has_paginator=True,
+        max_page=max_page,
+        has_next=max_page > current_page,
     )
-    tables = _xpath_elements(tree, f"//table[{class_predicates}]")
-    rows: list[etree._Element] = []
-    for table in tables:
-        if _xpath_elements(table, "./tbody"):
-            rows.extend(_xpath_elements(table, "./tbody/tr"))
-        else:
-            rows.extend(_xpath_elements(table, "./tr[td]"))
-    return rows
 
 
-def _is_empty_notice_row(cells: list[etree._Element]) -> bool:
-    if len(cells) != 1 or cells[0].get("colspan") is None:
-        return False
-    text = _element_text(cells[0])
-    if not text or not any(ch.isdigit() for ch in text):
-        return True
-    return bool(_EMPTY_NOTICE_RE.search(text))
-
-
-def _extract_char_name(cell: etree._Element) -> str:
-    char_links = _xpath_elements(
-        cell,
-        ".//a[contains(concat(' ', normalize-space(@class), ' '), ' char-link ')]",
+def _page_fingerprint(records: list[dict[str, Any]]) -> tuple[tuple[tuple[str, str], ...], ...]:
+    return tuple(
+        tuple((key, repr(val)) for key, val in sorted(record.items())) for record in records
     )
-    if char_links:
-        return _element_text(char_links[0])
-    links = _xpath_elements(cell, ".//a")
-    if links:
-        return _element_text(links[0])
-    return _element_text(cell)
-
-
-def _extract_race_from_cell(cell: etree._Element) -> str | None:
-    for img in _xpath_elements(cell, ".//img"):
-        for attr in ("data-race", "alt", "title"):
-            raw_val = img.get(attr)
-            if raw_val and raw_val.strip():
-                return raw_val.strip()
-        src = img.get("src")
-        if src and src.strip():
-            filename = Path(urlsplit(src.strip()).path).name
-            if filename:
-                return filename
-    return None
-
-
-def _parse_optional_numeric(raw_val: str) -> int | float | str:
-    compact = raw_val.replace(",", "").strip()
-    if compact.isascii() and compact.isdigit():
-        try:
-            return int(compact)
-        except ValueError:
-            return raw_val
-    try:
-        parsed = float(compact)
-    except ValueError:
-        return raw_val
-    return parsed if math.isfinite(parsed) else raw_val
 
 
 class ChronicleScraper(BaseRankingScraper):
@@ -174,13 +143,90 @@ class ChronicleScraper(BaseRankingScraper):
 
     server_id: str = "chronicle"
 
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS,
+        timeout_budget_seconds: float = DEFAULT_TIMEOUT_BUDGET_SECONDS,
+        max_pages_per_category: int | None = None,
+    ) -> None:
+        super().__init__(
+            settings=settings,
+            retry_delays=retry_delays,
+            timeout_budget_seconds=timeout_budget_seconds,
+        )
+        resolved_max_pages = (
+            max_pages_per_category
+            if max_pages_per_category is not None
+            else self.settings.max_pages_per_category
+        )
+        if resolved_max_pages < 1:
+            raise ValueError("max_pages_per_category must be >= 1")
+        self._max_pages_per_category: int = resolved_max_pages
+
+    async def _fetch_single_page(
+        self,
+        client: httpx.AsyncClient,
+        clean_base: str,
+        *,
+        route_template: str,
+        page: int,
+        category: str,
+        row_mapper: Callable[[etree._Element, list[etree._Element]], dict[str, Any]],
+    ) -> _FetchedPage:
+        url = f"{clean_base}{route_template.format(page=page)}"
+        try:
+            response = await self._fetch_url(client, url, category=category)
+        except TransportFetchError as exc:
+            if page > 1 and exc.status_code == 404:
+                return _FetchedPage(
+                    page=page,
+                    status_code=None,
+                    payload=None,
+                    records=[],
+                    paginator=_PaginatorInfo(has_paginator=False, max_page=None, has_next=False),
+                    not_found=True,
+                )
+            raise
+
+        payload = PagePayload(
+            url=str(response.url),
+            content=response.content,
+            status_code=response.status_code,
+            category=category,
+        )
+        rows = _extract_table_rows(
+            response.content,
+            _CHRONICLE_TABLE_CLASSES,
+            response.encoding,
+        )
+        page_records: list[dict[str, Any]] = []
+        for tr in rows:
+            cells = _xpath_elements(tr, "./td")
+            if not cells or _is_empty_notice_row(cells):
+                continue
+            page_records.append(row_mapper(tr, cells))
+
+        paginator = _extract_paginator_info(
+            response.content,
+            response.encoding,
+            current_page=page,
+        )
+        return _FetchedPage(
+            page=page,
+            status_code=response.status_code,
+            payload=payload,
+            records=page_records,
+            paginator=paginator,
+        )
+
     async def _fetch_paginated_html(
         self,
         client: httpx.AsyncClient,
         base_url: str,
         *,
         route_template: str,
-        max_pages: int,
         category: str,
         row_mapper: Callable[[etree._Element, list[etree._Element]], dict[str, Any]],
     ) -> CategoryFetchResult:
@@ -188,40 +234,149 @@ class ChronicleScraper(BaseRankingScraper):
         raw_records: list[dict[str, Any]] = []
         raw_payloads: list[PagePayload | tuple[str, bytes]] = []
         last_status: int | None = None
+        max_pages = self._max_pages_per_category
 
-        for page in range(1, max_pages + 1):
-            url = f"{clean_base}{route_template.format(page=page)}"
-            try:
-                response = await self._fetch_url(client, url, category=category)
-            except TransportFetchError as exc:
-                if page > 1 and exc.status_code == 404:
-                    break
-                raise
-            last_status = response.status_code
-            raw_payloads.append(
-                PagePayload(
-                    url=str(response.url),
-                    content=response.content,
-                    status_code=response.status_code,
-                    category=category,
+        first = await self._fetch_single_page(
+            client,
+            clean_base,
+            route_template=route_template,
+            page=1,
+            category=category,
+            row_mapper=row_mapper,
+        )
+        last_status = first.status_code
+        if first.payload is not None:
+            raw_payloads.append(first.payload)
+        if not first.records:
+            return CategoryFetchResult(
+                raw_records=raw_records,
+                raw_payloads=raw_payloads,
+                http_status_code=last_status,
+            )
+
+        raw_records.extend(first.records)
+        prev_fingerprint = _page_fingerprint(first.records)
+
+        if first.paginator.has_paginator:
+            if not first.paginator.has_next or first.paginator.max_page is None:
+                return CategoryFetchResult(
+                    raw_records=raw_records,
+                    raw_payloads=raw_payloads,
+                    http_status_code=last_status,
                 )
+
+            known_max_page = min(first.paginator.max_page, max_pages)
+            next_page = 2
+            while next_page <= known_max_page:
+                batch_end = min(
+                    next_page + DEFAULT_MAX_CONCURRENT_REQUESTS - 1,
+                    known_max_page,
+                )
+                batch_pages = list(range(next_page, batch_end + 1))
+
+                if len(batch_pages) == 1:
+                    fetched_batch = [
+                        await self._fetch_single_page(
+                            client,
+                            clean_base,
+                            route_template=route_template,
+                            page=batch_pages[0],
+                            category=category,
+                            row_mapper=row_mapper,
+                        )
+                    ]
+                else:
+                    try:
+                        async with asyncio.TaskGroup() as tg:
+                            tasks = [
+                                tg.create_task(
+                                    self._fetch_single_page(
+                                        client,
+                                        clean_base,
+                                        route_template=route_template,
+                                        page=p,
+                                        category=category,
+                                        row_mapper=row_mapper,
+                                    )
+                                )
+                                for p in batch_pages
+                            ]
+                    except ExceptionGroup as eg:
+                        leaves = _flatten_exceptions(eg)
+                        for exc_type in (
+                            BlockedChallengeError,
+                            TargetMaintenanceError,
+                            TransportFetchError,
+                        ):
+                            for leaf in leaves:
+                                if isinstance(leaf, exc_type):
+                                    raise leaf from None
+                        raise leaves[0] from None
+                    fetched_batch = [task.result() for task in tasks]
+
+                stop = False
+                for fetched in fetched_batch:
+                    if fetched.not_found:
+                        stop = True
+                        break
+                    if fetched.status_code is not None:
+                        last_status = fetched.status_code
+                    if fetched.payload is not None:
+                        raw_payloads.append(fetched.payload)
+                    if not fetched.records:
+                        stop = True
+                        break
+                    curr_fingerprint = _page_fingerprint(fetched.records)
+                    if curr_fingerprint == prev_fingerprint:
+                        stop = True
+                        break
+                    raw_records.extend(fetched.records)
+                    prev_fingerprint = curr_fingerprint
+
+                    if fetched.paginator.has_paginator:
+                        if fetched.paginator.max_page is not None:
+                            known_max_page = min(
+                                max(known_max_page, fetched.paginator.max_page),
+                                max_pages,
+                            )
+                        if not fetched.paginator.has_next:
+                            stop = True
+                            break
+
+                if stop:
+                    break
+                next_page = batch_end + 1
+
+            return CategoryFetchResult(
+                raw_records=raw_records,
+                raw_payloads=raw_payloads,
+                http_status_code=last_status,
             )
 
-            rows = _extract_table_rows(
-                response.content,
-                _CHRONICLE_TABLE_CLASSES,
-                response.encoding,
+        # Fallback when HTML has no `paginatorAjax` links: sequential probing with
+        # anti-clamping fingerprint guard, 404 stop, and empty-page stop.
+        for page in range(2, max_pages + 1):
+            fetched = await self._fetch_single_page(
+                client,
+                clean_base,
+                route_template=route_template,
+                page=page,
+                category=category,
+                row_mapper=row_mapper,
             )
-            page_records: list[dict[str, Any]] = []
-            for tr in rows:
-                cells = _xpath_elements(tr, "./td")
-                if not cells or _is_empty_notice_row(cells):
-                    continue
-                page_records.append(row_mapper(tr, cells))
-
-            if not page_records:
+            if fetched.not_found:
                 break
-            raw_records.extend(page_records)
+            if fetched.status_code is not None:
+                last_status = fetched.status_code
+            if fetched.payload is not None:
+                raw_payloads.append(fetched.payload)
+            if not fetched.records:
+                break
+            curr_fingerprint = _page_fingerprint(fetched.records)
+            if curr_fingerprint == prev_fingerprint:
+                break
+            raw_records.extend(fetched.records)
+            prev_fingerprint = curr_fingerprint
 
         return CategoryFetchResult(
             raw_records=raw_records,
@@ -245,22 +400,22 @@ class ChronicleScraper(BaseRankingScraper):
         }
 
     @staticmethod
-    def _map_job_row(_tr: etree._Element, cells: list[etree._Element]) -> dict[str, Any]:
-        char_name = _extract_char_name(cells[1]) if len(cells) > 1 else None
-        extra_metrics: dict[str, Any] = {}
-        kd_ratio = _cell_text(cells, 3)
-        if kd_ratio is not None and kd_ratio not in _EMPTY_PLACEHOLDERS:
-            extra_metrics["job_kd_ratio"] = kd_ratio
+    def _make_job_row_mapper(
+        job_type: Literal["TRADER", "HUNTER", "THIEF"],
+    ) -> Callable[[etree._Element, list[etree._Element]], dict[str, Any]]:
+        def _map_row(_tr: etree._Element, cells: list[etree._Element]) -> dict[str, Any]:
+            char_name = _extract_char_name(cells[1]) if len(cells) > 1 else None
+            return {
+                "rank": _strip_rank_prefix(_cell_text(cells, 0)),
+                "char_name": char_name,
+                "guild_name": _cell_text(cells, 2),
+                "job_type": job_type,
+                "job_level": _cell_text(cells, 3),
+                "job_exp": _cell_text(cells, 4),
+                "extra_metrics": {},
+            }
 
-        return {
-            "rank": _strip_rank_prefix(_cell_text(cells, 0)),
-            "char_name": char_name,
-            "guild_name": _cell_text(cells, 2),
-            "job_type": None,
-            "job_level": None,
-            "job_points": _cell_text(cells, 4),
-            "extra_metrics": extra_metrics,
-        }
+        return _map_row
 
     @staticmethod
     def _map_guild_row(_tr: etree._Element, cells: list[etree._Element]) -> dict[str, Any]:
@@ -289,12 +444,11 @@ class ChronicleScraper(BaseRankingScraper):
         client: httpx.AsyncClient,
         base_url: str,
     ) -> CategoryFetchResult:
-        """Fetch and parse Chronicle player ranking pages (1..10)."""
+        """Fetch and parse all Chronicle player ranking pages."""
         return await self._fetch_paginated_html(
             client,
             base_url,
             route_template="/ranking/top-player-{page}.html",
-            max_pages=_PLAYER_MAX_PAGES,
             category="player",
             row_mapper=self._map_player_row,
         )
@@ -304,14 +458,47 @@ class ChronicleScraper(BaseRankingScraper):
         client: httpx.AsyncClient,
         base_url: str,
     ) -> CategoryFetchResult:
-        """Fetch and parse Chronicle job ranking pages (1..5)."""
-        return await self._fetch_paginated_html(
-            client,
-            base_url,
-            route_template="/ranking/top-job-{page}.html",
-            max_pages=_JOB_MAX_PAGES,
-            category="job",
-            row_mapper=self._map_job_row,
+        """Fetch and parse all Chronicle job ranking filters (trader, hunter, thieves)."""
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [
+                    tg.create_task(
+                        self._fetch_paginated_html(
+                            client,
+                            base_url,
+                            route_template=route_template,
+                            category="job",
+                            row_mapper=self._make_job_row_mapper(job_type),
+                        )
+                    )
+                    for job_type, route_template in _CHRONICLE_JOB_ROUTES
+                ]
+        except ExceptionGroup as eg:
+            leaves = _flatten_exceptions(eg)
+            for exc_type in (
+                BlockedChallengeError,
+                TargetMaintenanceError,
+                TransportFetchError,
+            ):
+                for leaf in leaves:
+                    if isinstance(leaf, exc_type):
+                        raise leaf from None
+            raise leaves[0] from None
+
+        combined_records: list[dict[str, Any]] = []
+        combined_payloads: list[PagePayload | tuple[str, bytes]] = []
+        last_status: int | None = None
+        for task in tasks:
+            sub_result = task.result()
+            combined_records.extend(sub_result.raw_records)
+            combined_payloads.extend(sub_result.raw_payloads)
+            if sub_result.http_status_code is not None:
+                last_status = sub_result.http_status_code
+
+        return CategoryFetchResult(
+            raw_records=combined_records,
+            raw_payloads=combined_payloads,
+            http_status_code=last_status,
         )
 
     async def fetch_guild_pages(
@@ -319,12 +506,11 @@ class ChronicleScraper(BaseRankingScraper):
         client: httpx.AsyncClient,
         base_url: str,
     ) -> CategoryFetchResult:
-        """Fetch and parse Chronicle guild ranking pages (1..2)."""
+        """Fetch and parse all Chronicle guild ranking pages."""
         return await self._fetch_paginated_html(
             client,
             base_url,
             route_template="/ranking/top-guild-{page}.html",
-            max_pages=_GUILD_MAX_PAGES,
             category="guild",
             row_mapper=self._map_guild_row,
         )
