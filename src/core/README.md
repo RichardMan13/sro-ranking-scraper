@@ -17,6 +17,7 @@ Shared foundational infrastructure for the `sro-ranking-scraper` application. Th
 - `[logging.py:bind_run_context]`: Binds non-`None` `server_id` and `run_id` (stringified from `str | UUID`) into `structlog.contextvars`.
 - `[logging.py:clear_run_context]`: Clears all `structlog.contextvars` bindings for the current execution context.
 - `[notifications.py:OPS_ALERT_STATUSES]` / `[notifications.py:POST_FW_SUCCESS_STATUSES]`: Canonical `ScrapeStatus` sets gating operational alerts (`SCHEMA_DRIFT`, `LOW_COUNT_QUARANTINE`, `BLOCKED_CHALLENGE`, `HTTP_ERROR`) and post-FW summaries (`SUCCESS`, `PARTIAL_SUCCESS`).
+- `[notifications.py:WEBHOOK_TIMEOUT_SECONDS]` (`10.0`), `[notifications.py:WEBHOOK_HTTP_TIMEOUT]` (`httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)`), `[notifications.py:POST_FW_BASELINE_WINDOW_HOURS]` (`24`), `[notifications.py:POST_FW_SNAPSHOT_TOLERANCE_MINUTES]` (`5`), `[notifications.py:POST_FW_TOP_GUILDS_LIMIT]` (`5`), `[notifications.py:EMBED_TITLE_MAX_LEN]` (`256`), `[notifications.py:EMBED_DESCRIPTION_MAX_LEN]` (`4096`), `[notifications.py:EMBED_FIELD_VALUE_MAX_LEN]` (`1024`), `[notifications.py:EMBED_FOOTER_MAX_LEN]` (`2048`): Timeout, comparison window, and Discord embed length constants.
 - `[notifications.py:GuildRankEntry]` / `[notifications.py:PostFWComparison]`: Frozen dataclasses (`slots=True`) representing Top 5 official guild rows (`total_item_points: Decimal`) and post-FW vs. 24h baseline comparisons.
 - `[notifications.py:build_ops_alert_payload]` / `[notifications.py:build_post_fw_payload]`: Pure PT-BR Discord embed builders enforcing `"allowed_mentions": {"parse": []}`, Markdown escaping on untrusted fields, UTC timestamps (`YYYY-MM-DD HH:MM UTC`), PT-BR integer rounding (`ROUND_HALF_UP`), and Discord field length truncation.
 - `[notifications.py:send_discord_webhook]`: Async best-effort HTTP `POST` (`asyncio.timeout(10.0)`, `follow_redirects=False`, `0` retries) returning `True` on `2xx` and `False` on no-op or failure without propagating exceptions or logging webhook URLs.
@@ -46,4 +47,4 @@ Shared foundational infrastructure for the `sro-ranking-scraper` application. Th
 - `[notifications.py:load_post_fw_comparison]`: Executes read-only SQL `SELECT` queries against `servers`, `scrape_runs`, `guild_snapshots`, and `guilds` through the provided `AsyncSession`.
 
 ## Verification
-- Run: `pytest`
+- Run: `uv run --no-sync pytest`

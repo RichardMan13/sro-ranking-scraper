@@ -33,8 +33,9 @@ A containerized, HTTP-first data pipeline that extracts public player, guild, an
 
 ## Subdirectories & System Boundaries
 - [alembic](./alembic/README.md) — Async Alembic migration runner (`env.py`) and linear PostgreSQL 16 migration chain ([alembic/versions](./alembic/versions/README.md)) defining tables, server seeds, monthly range partitions, indexes, and 5 analytical SQL views.
+- [scripts](./scripts/README.md) — Operational shell scripts for database administration (`provision_readonly_role.sh` for idempotent `sro_readonly` PostgreSQL role provisioning).
 - [src](./src/README.md) — Core Python application package organized into:
-  - [src/core](./src/core/README.md) — Pydantic environment settings, async SQLAlchemy engine/session factories, monthly partition DDL provisioning, and JSON `structlog` configuration.
+  - [src/core](./src/core/README.md) — Pydantic environment settings, async SQLAlchemy engine/session factories, monthly partition DDL provisioning, JSON `structlog` configuration, and best-effort Discord webhook notifications.
   - [src/models](./src/models/README.md) — SQLAlchemy 2.0 PostgreSQL ORM models and Pydantic v2 raw ranking validation/normalization schemas.
   - [src/scrapers](./src/scrapers/README.md) — HTTP/2 scraper engine (`BaseRankingScraper`), target server parsers (`ChronicleScraper`, `ElectusScraper`, `PlayGoldenScraper`), circuit breaker, integrity guards, gzip quarantine, and bulk persistence.
   - [src/flows](./src/flows/README.md) — Prefect 3 tasks, scheduled/post-FW/manual flows, dynamic cron deployment builder, and CLI entrypoint.
@@ -43,17 +44,19 @@ A containerized, HTTP-first data pipeline that extracts public player, guild, an
 ## Global Invariants
 - **Append-Only Partitioned Fact Tables:** `character_snapshots` and `guild_snapshots` use PostgreSQL `RANGE (created_at)` partitioning with composite primary keys `(id, created_at)` and unique constraints including `created_at`; every Prefect flow invokes `ensure_partitions_task` before scraping.
 - **Canonical Status & Trigger Alignment:** `scrape_runs.status` (`ck_scrape_runs_status`) stays aligned with `CANONICAL_STATUSES` (`SUCCESS`, `PARTIAL_SUCCESS`, `SCHEMA_DRIFT`, `LOW_COUNT_QUARANTINE`, `BLOCKED_CHALLENGE`, `TARGET_MAINTENANCE`, `HTTP_ERROR`), and `BaseRankingScraper.run` validates `trigger_type` against `CANONICAL_TRIGGER_TYPES`.
-- **Circuit Breaker & Retry Isolation:** `BaseRankingScraper.run` checks `servers.circuit_breaker_until` (UTC) before any network call; anti-bot challenges (`403`/`429`, `cf-mitigated: challenge`, Cloudflare/Turnstile markers) and maintenance responses abort with zero retries, while Prefect tasks execute with `retries=0` and isolate multi-server failures via `return_state=True`.
+- **Circuit Breaker & Retry Isolation:** `BaseRankingScraper.run` checks `servers.circuit_breaker_until` (UTC) before any network call; anti-bot challenges (`403`/`429`, `cf-mitigated: challenge`, HTTP `513` with `__diamwall` cookie, Cloudflare/Turnstile markers) and maintenance responses abort with zero retries, while Prefect tasks execute with `retries=0` and isolate multi-server failures via `return_state=True`.
 - **No Raw HTML in PostgreSQL:** Rejected or challenge response payloads are quarantined solely as deterministic `.html.gz` files on local disk (`<quarantine_dir>/<server_id>/<run_id>.html.gz`), never stored in PostgreSQL columns.
 - **Integrity Guards & Reconciliation:** Validation enforces entity deduplication (lowest rank wins), podium rank `1..3` checks for players and guilds, `MAX_ERROR_RATE = 0.05`, minimum player (`servers.min_records_expected`) and guild (`MIN_GUILD_RECORDS = 5`) thresholds, and case-sensitive job-to-player left-join reconciliation.
+- **Two-Layer Read-Only Dashboard Isolation:** `src/dashboard` connects exclusively via `DASHBOARD_DATABASE_URL` (`SecretStr`, synchronous `psycopg`) using the least-privilege `sro_readonly` role (`scripts/provision_readonly_role.sh`) and session guardrails (`default_transaction_read_only=on`, `statement_timeout=15000`, `lock_timeout=3000`, `work_mem=16MB`), with explicit `created_at` partition pruning and zero `pandas` imports.
+- **Best-Effort Notification Isolation:** Optional Discord webhooks (`notify_operational_failure`, `notify_post_fw_summary`) run only after async DB engines are disposed, use a 10s timeout with zero retries, never propagate exceptions, and never log webhook URLs or raw exception strings.
 
 ## Global Side Effects
-- **External Network I/O:** Issues async HTTP/2 `GET` requests via `httpx.AsyncClient` to Chronicle SRO, Electus Online, and Play Golden with rotating browser header profiles and optional `cf_clearance` cookies.
-- **PostgreSQL 16 Mutations:** Runs Alembic DDL/DML migrations, executes `CREATE TABLE IF NOT EXISTS ... PARTITION OF` monthly partition DDL, updates `servers.circuit_breaker_until`, records `scrape_runs` audit rows, bulk-upserts `guilds` and `characters`, and bulk-inserts `character_snapshots` and `guild_snapshots` in 1,000-row chunks.
+- **External Network I/O:** Issues async HTTP/2 `GET` requests via `httpx.AsyncClient` to Chronicle SRO, Electus Online, and Play Golden with rotating browser header profiles and optional `cf_clearance` cookies, plus optional best-effort HTTPS `POST` requests to Discord webhooks.
+- **PostgreSQL 16 Mutations & Queries:** Runs Alembic DDL/DML migrations, provisions `sro_readonly` role/grants via `scripts/provision_readonly_role.sh`, executes `CREATE TABLE IF NOT EXISTS ... PARTITION OF` monthly partition DDL, updates `servers.circuit_breaker_until`, records `scrape_runs` audit rows, bulk-upserts `guilds` and `characters`, bulk-inserts `character_snapshots` and `guild_snapshots` in 1,000-row chunks, and executes read-only analytical `SELECT` queries for the dashboard and post-FW summaries.
 - **Local Filesystem & Process State:** Writes gzipped dead-letter archives to `<quarantine_dir>/<server_id>/<run_id>.html.gz`, recursively unlinks expired `*.html.gz` files in `purge_old_quarantine_task`, configures global `structlog` JSON stdout logging and contextvars, and registers/serves Prefect 3 cron deployments.
 
 ## System Verification
-- Run: `pytest`
+- Run: `uv run --no-sync pytest`
 
 ---
 
@@ -185,7 +188,7 @@ alembic upgrade head
 ## Orchestration, CLI & Prefect UI
 
 ### 1. Scheduled Mode (`--mode serve`)
-The `scraper-worker` container runs `python -m src.flows.orchestrator --mode serve` by default. At startup, it queries active rows in `servers` and registers four Prefect 3 deployments:
+The `scraper-worker` image defaults to `python -m src.flows.orchestrator --mode serve` (`Dockerfile`), while `docker-compose.yml` overrides the service command to `sh -c "alembic upgrade head && exec python -m src.flows.orchestrator --mode serve"`. At startup, it queries active rows in `servers` and registers four Prefect 3 deployments:
 - `scheduled-12h` (`cron="0 0,12 * * *"`) — runs `ensure_partitions_task`, scrapes every active server in isolation (`return_state=True`), and runs `purge_old_quarantine_task`.
 - `post-fw-chronicle` (`cron="30 22 * * 0"`) — runs 30 minutes after Chronicle Fortress War (Sunday 22:00 UTC).
 - `post-fw-electus` (`cron="30 21 * * 0"`) — runs 30 minutes after Electus Fortress War (Sunday 21:00 UTC).
@@ -344,8 +347,8 @@ gzip -dc ./quarantine/chronicle/<run_id>.html.gz | head -n 40
 
 ### Verification Checklist
 ```bash
-ruff check .
-ruff format --check .
-mypy src tests
-pytest --cov=src tests/
+uv run --no-sync ruff check .
+uv run --no-sync ruff format --check .
+uv run --no-sync mypy src tests
+uv run --no-sync pytest --cov=src tests/
 ```

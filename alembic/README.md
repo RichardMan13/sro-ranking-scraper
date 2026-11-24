@@ -17,7 +17,7 @@ Configures and executes Alembic schema and analytical-view migrations for Postgr
 - `[env.py:_normalize_async_url]` — Strips whitespace, lowercases the URL scheme, and rewrites `postgres://` and `postgresql://` prefixes to `postgresql+asyncpg://`.
 - `[env.py:_resolve_database_url]` — Re-raises `pydantic.ValidationError` from `Settings()` if any error has `type != "missing"`.
 - `[env.py:_resolve_database_url]` — In online mode, raises `RuntimeError` if `DATABASE_URL` is missing and `sqlalchemy.url` is empty or equals `_DEFAULT_OFFLINE_URL` (`postgresql+asyncpg://localhost/sro_rankings`).
-- `[env.py:_resolve_database_url]` — In offline mode, falls back to `_DEFAULT_OFFLINE_URL` when no URL is configured and escapes `%` as `%%` when writing `sqlalchemy.url` back to Alembic config.
+- `[env.py:_resolve_database_url]` — In offline mode, falls back to `_DEFAULT_OFFLINE_URL` when no URL is configured; unconditionally escapes `%` as `%%` when writing `sqlalchemy.url` back to Alembic config in both online and offline modes.
 - `[env.py:run_async_migrations]` — Always uses `sqlalchemy.pool.NullPool` and disposes the engine after executing migrations.
 
 ## Side Effects
@@ -26,4 +26,4 @@ Configures and executes Alembic schema and analytical-view migrations for Postgr
 - `[env.py:context.is_offline_mode]` — Executes `run_migrations_offline()` or `run_migrations_online()` immediately on module execution, connecting to PostgreSQL over `asyncpg` in online mode to apply DDL/DML migrations.
 
 ## Verification
-- Run: `pytest`
+- Run: `uv run --no-sync pytest`

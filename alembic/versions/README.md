@@ -16,12 +16,12 @@ Linear PostgreSQL 16 Alembic migration chain defining the core relational schema
 - Subdirectories: none.
 
 ## Invariants
-- Linear revision chain: `[003_dashboard_indexes.py:down_revision]` strictly depends on `[002_analytical_views.py:revision]`, which depends on `[001_initial_schema.py:revision]`, and views in `002_analytical_views.py` must be dropped before base tables in `001_initial_schema.py`.
-- Partitioned fact primary and unique keys include the partition key: `character_snapshots` uses `pk_character_snapshots (id, created_at)` and `uq_char_snapshot_run (scrape_run_id, character_id, created_at)`, and `guild_snapshots` uses `pk_guild_snapshots (id, created_at)` and `uq_guild_snapshot_run (scrape_run_id, guild_id, created_at)`, both partitioned by `RANGE (created_at)`.
+- Linear revision chain: `[003_dashboard_indexes.py:down_revision]` strictly depends on `[002_analytical_views.py:revision]`, which depends on `[001_initial_schema.py:revision]`, and views in `[002_analytical_views.py:downgrade]` must be dropped before base tables in `[001_initial_schema.py:downgrade]`.
+- Partitioned fact primary and unique keys in `[001_initial_schema.py:upgrade]` include the partition key: `character_snapshots` uses `pk_character_snapshots (id, created_at)` and `uq_char_snapshot_run (scrape_run_id, character_id, created_at)`, and `guild_snapshots` uses `pk_guild_snapshots (id, created_at)` and `uq_guild_snapshot_run (scrape_run_id, guild_id, created_at)`, both partitioned by `RANGE (created_at)`.
 - Domain check and uniqueness constraints in `[001_initial_schema.py:upgrade]`: `scrape_runs.status` is restricted to `('SUCCESS', 'PARTIAL_SUCCESS', 'SCHEMA_DRIFT', 'LOW_COUNT_QUARANTINE', 'BLOCKED_CHALLENGE', 'TARGET_MAINTENANCE', 'HTTP_ERROR')`; `characters.race` is restricted to `('CH', 'EU', 'UNK')`; `uq_char_per_server (server_id, char_name)` and `uq_guild_per_server (server_id, guild_name)` enforce per-server natural uniqueness.
-- Idempotent server seeding: initial rows in `servers` (`chronicle`, `electus`, `play_golden`) use `ON CONFLICT (id) DO NOTHING`.
+- Idempotent server seeding in `[001_initial_schema.py:upgrade]`: initial rows in `servers` (`chronicle`, `electus`, `play_golden`) use `ON CONFLICT (id) DO NOTHING`.
 - View dependency order in `[002_analytical_views.py:upgrade]` and `[002_analytical_views.py:downgrade]`: `v_bot_vs_donor_classification` and `v_server_retention_weekly` query `v_character_activity_deltas`, so `v_character_activity_deltas` must be created first and dropped last.
-- Latest-run analytical filtering: `v_guild_turnover_dominance` and `v_race_balance_ch_vs_eu` only consider `scrape_runs` with `status IN ('SUCCESS', 'PARTIAL_SUCCESS')`.
+- Latest-run analytical filtering in `[002_analytical_views.py:upgrade]` and `[003_dashboard_indexes.py:upgrade]`: `v_guild_turnover_dominance`, `v_race_balance_ch_vs_eu`, and partial index `idx_scrape_runs_server_latest` only consider `scrape_runs` with `status IN ('SUCCESS', 'PARTIAL_SUCCESS')`.
 
 ## Side Effects
 - Executes raw PostgreSQL 16 DDL and DML statements via `alembic.op.execute`.
@@ -30,4 +30,4 @@ Linear PostgreSQL 16 Alembic migration chain defining the core relational schema
 - `[003_dashboard_indexes.py:upgrade]` creates partial index `idx_scrape_runs_server_latest` on `scrape_runs`; `[003_dashboard_indexes.py:downgrade]` drops that index.
 
 ## Verification
-- Run: `pytest`
+- Run: `uv run --no-sync pytest`

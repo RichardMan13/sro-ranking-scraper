@@ -35,4 +35,4 @@ Prefect 3 orchestration layer for the SRO Ranking Scraper. This package defines 
 - **Process / Prefect Runner**: `[orchestrator.py:serve_deployments]` registers deployments and blocks serving scheduled runs via `prefect.serve`; flows configure global structured logging via `configure_logging`.
 
 ## Verification
-- Run: `pytest`
+- Run: `uv run --no-sync pytest`
